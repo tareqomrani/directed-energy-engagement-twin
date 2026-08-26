@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 st.set_page_config(
     page_title="Directed Energy Engagement Digital Twin",
@@ -2572,6 +2573,452 @@ def simulate_dynamic_monte_carlo_run(
     return final_state
 
 
+
+def build_3d_digital_twin_figure(
+    timeline: pd.DataFrame,
+    env: Environment,
+    tgt: Target,
+    result: dict,
+    selected_index: int,
+    display_altitude_m: float,
+):
+    """
+    Interactive 3-D visualization layer for the authoritative engagement timeline.
+
+    The current physics engine remains a 2-D constant-velocity engagement model.
+    This function embeds that solved engagement plane in 3-D for systems visualization.
+    The display altitude is intentionally presentation-only and does not feed back into
+    range, atmosphere, pointing, irradiance, or thermal calculations.
+    """
+    if timeline is None or timeline.empty:
+        return go.Figure()
+
+    selected_index = int(
+        clamp(
+            selected_index,
+            0,
+            len(timeline) - 1,
+        )
+    )
+
+    radial_closing, transverse = target_velocity_components_mps(tgt)
+    r0_m = np.array(
+        [
+            env.range_km * 1000.0,
+            0.0,
+        ],
+        dtype=float,
+    )
+    velocity_mps = np.array(
+        [
+            -radial_closing,
+            transverse,
+        ],
+        dtype=float,
+    )
+
+    times_s = timeline["Time (s)"].to_numpy(dtype=float)
+    positions_m = np.array(
+        [
+            r0_m + velocity_mps * t
+            for t in times_s
+        ]
+    )
+
+    x_km = positions_m[:, 0] / 1000.0
+    y_km = positions_m[:, 1] / 1000.0
+    z_km = np.full_like(
+        x_km,
+        display_altitude_m / 1000.0,
+        dtype=float,
+    )
+
+    t_sel = float(times_s[selected_index])
+    p_sel = positions_m[selected_index]
+    x_sel_km = float(p_sel[0] / 1000.0)
+    y_sel_km = float(p_sel[1] / 1000.0)
+    z_sel_km = float(display_altitude_m / 1000.0)
+
+    # CPA marker in the same embedded engagement plane.
+    radial_closing_now, transverse_now = target_velocity_components_mps(tgt)
+    v_mps = np.array(
+        [
+            -radial_closing_now,
+            transverse_now,
+        ],
+        dtype=float,
+    )
+    geometry = engagement_geometry(env, tgt)
+    t_cpa = geometry["time_to_cpa_s"]
+    if math.isfinite(t_cpa):
+        p_cpa = r0_m + v_mps * t_cpa
+        cpa_x_km = float(p_cpa[0] / 1000.0)
+        cpa_y_km = float(p_cpa[1] / 1000.0)
+    else:
+        cpa_x_km = float("nan")
+        cpa_y_km = float("nan")
+
+    # Engagement-zone ring for spatial context.
+    theta = np.linspace(
+        0.0,
+        2.0 * math.pi,
+        181,
+    )
+    zone_radius_km = max(
+        25.0,
+        env.range_km,
+    )
+    zone_x = zone_radius_km * np.cos(theta)
+    zone_y = zone_radius_km * np.sin(theta)
+    zone_z = np.zeros_like(zone_x)
+
+    # A dark "sea/ground" reference plane. Deliberately schematic.
+    plane_extent_km = max(
+        zone_radius_km,
+        np.nanmax(np.abs(x_km)) + 2.0,
+        np.nanmax(np.abs(y_km)) + 2.0,
+    )
+    grid = np.linspace(
+        -plane_extent_km,
+        plane_extent_km,
+        2,
+    )
+    xx, yy = np.meshgrid(grid, grid)
+    zz = np.zeros_like(xx)
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Surface(
+            x=xx,
+            y=yy,
+            z=zz,
+            surfacecolor=np.zeros_like(zz),
+            colorscale=[
+                [0.0, "#020402"],
+                [1.0, "#061006"],
+            ],
+            opacity=0.92,
+            showscale=False,
+            hoverinfo="skip",
+            name="Reference Plane",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=zone_x,
+            y=zone_y,
+            z=zone_z,
+            mode="lines",
+            line=dict(
+                color=HUD_GREEN_DIM,
+                width=2,
+                dash="dot",
+            ),
+            name="Model Zone",
+            hoverinfo="skip",
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=x_km,
+            y=y_km,
+            z=z_km,
+            mode="lines",
+            line=dict(
+                color=HUD_ORANGE,
+                width=6,
+            ),
+            name="Target Path",
+            hovertemplate=(
+                "Target path"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Platform and vertical mast line.
+    fig.add_trace(
+        go.Scatter3d(
+            x=[0.0],
+            y=[0.0],
+            z=[0.0],
+            mode="markers+text",
+            marker=dict(
+                size=11,
+                color=HUD_GREEN_BRIGHT,
+                symbol="diamond",
+                line=dict(
+                    color="#E9FFE1",
+                    width=1,
+                ),
+            ),
+            text=["DE Platform"],
+            textposition="top center",
+            name="DE Platform",
+            hovertemplate=(
+                "Directed-energy platform"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Current beam line.
+    fig.add_trace(
+        go.Scatter3d(
+            x=[0.0, x_sel_km],
+            y=[0.0, y_sel_km],
+            z=[0.0, z_sel_km],
+            mode="lines",
+            line=dict(
+                color=HUD_GREEN_BRIGHT,
+                width=8,
+            ),
+            name="Beam / LOS",
+            hovertemplate=(
+                "Beam / LOS"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Current target.
+    fig.add_trace(
+        go.Scatter3d(
+            x=[x_sel_km],
+            y=[y_sel_km],
+            z=[z_sel_km],
+            mode="markers+text",
+            marker=dict(
+                size=9,
+                color=HUD_ORANGE_BRIGHT,
+                symbol="circle",
+                line=dict(
+                    color="#FFE0B2",
+                    width=1,
+                ),
+            ),
+            text=[f"{tgt.target_type}"],
+            textposition="top center",
+            name="Current Target",
+            customdata=[[
+                t_sel,
+                float(timeline.iloc[selected_index]["Range (km)"]),
+                float(timeline.iloc[selected_index]["Average Irradiance (kW/m^2)"]),
+                float(timeline.iloc[selected_index]["Estimated Thermal Effect Index"]),
+            ]],
+            hovertemplate=(
+                "<b>Current target</b><br>"
+                "Time: %{customdata[0]:.2f} s<br>"
+                "Range: %{customdata[1]:.2f} km<br>"
+                "Avg. irradiance: %{customdata[2]:.2f} kW/m²<br>"
+                "Thermal effect index: %{customdata[3]:.1%}"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # CPA marker.
+    if math.isfinite(cpa_x_km) and math.isfinite(cpa_y_km):
+        fig.add_trace(
+            go.Scatter3d(
+                x=[cpa_x_km],
+                y=[cpa_y_km],
+                z=[z_sel_km],
+                mode="markers+text",
+                marker=dict(
+                    size=7,
+                    color="#FFFFFF",
+                    symbol="x",
+                ),
+                text=["CPA"],
+                textposition="bottom center",
+                name="CPA",
+                hovertemplate=(
+                    f"CPA range: {geometry['cpa_range_m']:.1f} m"
+                    "<extra></extra>"
+                ),
+            )
+        )
+
+    # Approximate 1-sigma track uncertainty ring in the embedded engagement plane.
+    try:
+        sigma_cross_m = float(
+            timeline.iloc[selected_index]["Track Cross-Range 1σ (m)"]
+        )
+        sigma_radial_m = float(
+            timeline.iloc[selected_index]["Track Radial 1σ (m)"]
+        )
+    except Exception:
+        sigma_cross_m = float(
+            result.get(
+                "Track Cross-Range 1σ (m)",
+                0.0,
+            )
+        )
+        sigma_radial_m = float(
+            result.get(
+                "Track Radial 1σ (m)",
+                0.0,
+            )
+        )
+
+    # Rotate a radial/cross-range ellipse into the instantaneous LOS frame.
+    target_xy_m = p_sel
+    range_xy_m = max(
+        float(np.linalg.norm(target_xy_m)),
+        1.0,
+    )
+    u_r = target_xy_m / range_xy_m
+    u_t = np.array(
+        [
+            -u_r[1],
+            u_r[0],
+        ]
+    )
+
+    phi = np.linspace(
+        0.0,
+        2.0 * math.pi,
+        121,
+    )
+    ellipse_xy_m = np.array(
+        [
+            target_xy_m
+            + sigma_radial_m * math.cos(a) * u_r
+            + sigma_cross_m * math.sin(a) * u_t
+            for a in phi
+        ]
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=ellipse_xy_m[:, 0] / 1000.0,
+            y=ellipse_xy_m[:, 1] / 1000.0,
+            z=np.full(
+                len(phi),
+                z_sel_km,
+            ),
+            mode="lines",
+            line=dict(
+                color="#FFB15A",
+                width=4,
+                dash="dot",
+            ),
+            name="Track 1σ",
+            hoverinfo="skip",
+        )
+    )
+
+    # Beam-footprint ring at target plane using the current effective spot diameter.
+    spot_diameter_m = float(
+        timeline.iloc[selected_index]["Spot Diameter (m)"]
+    )
+    spot_radius_km = max(
+        spot_diameter_m / 2.0 / 1000.0,
+        1e-6,
+    )
+    beam_phi = np.linspace(
+        0.0,
+        2.0 * math.pi,
+        121,
+    )
+    footprint_x = (
+        x_sel_km
+        + spot_radius_km * np.cos(beam_phi)
+    )
+    footprint_y = (
+        y_sel_km
+        + spot_radius_km * np.sin(beam_phi)
+    )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=footprint_x,
+            y=footprint_y,
+            z=np.full(
+                len(beam_phi),
+                z_sel_km,
+            ),
+            mode="lines",
+            line=dict(
+                color=HUD_GREEN,
+                width=4,
+            ),
+            name="Effective Beam Footprint",
+            hoverinfo="skip",
+        )
+    )
+
+    fig.update_layout(
+        height=760,
+        margin=dict(
+            l=0,
+            r=0,
+            t=50,
+            b=0,
+        ),
+        paper_bgcolor=HUD_BG,
+        plot_bgcolor=HUD_BG,
+        font=dict(
+            color=HUD_TEXT,
+            family="Consolas, monospace",
+        ),
+        title=dict(
+            text=(
+                "3D DIGITAL TWIN VIEW"
+                " • "
+                f"t = {t_sel:.2f} s"
+            ),
+            font=dict(
+                color=HUD_ORANGE_BRIGHT,
+                size=20,
+            ),
+        ),
+        legend=dict(
+            bgcolor="rgba(2,4,2,0.75)",
+            bordercolor=HUD_GREEN_DIM,
+            borderwidth=1,
+        ),
+        scene=dict(
+            bgcolor=HUD_BG,
+            aspectmode="data",
+            xaxis=dict(
+                title="X / LOS Axis (km)",
+                color=HUD_TEXT,
+                gridcolor="#173817",
+                zerolinecolor=HUD_GREEN_DIM,
+                backgroundcolor=HUD_BG,
+            ),
+            yaxis=dict(
+                title="Y / Cross-Range (km)",
+                color=HUD_TEXT,
+                gridcolor="#173817",
+                zerolinecolor=HUD_GREEN_DIM,
+                backgroundcolor=HUD_BG,
+            ),
+            zaxis=dict(
+                title="Display Altitude (km)",
+                color=HUD_TEXT,
+                gridcolor="#3A2814",
+                zerolinecolor=HUD_ORANGE_DIM,
+                backgroundcolor=HUD_BG,
+            ),
+            camera=dict(
+                eye=dict(
+                    x=1.35,
+                    y=1.35,
+                    z=0.85,
+                )
+            ),
+        ),
+    )
+
+    return fig
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -3033,6 +3480,20 @@ with st.sidebar:
     )
 
 
+    st.subheader("3D Digital Twin View")
+    display_altitude_m = st.slider(
+        "Display altitude (m)",
+        0.0,
+        5000.0,
+        1000.0,
+        100.0,
+        help=(
+            "Visualization-only altitude. The current engagement physics remains "
+            "a 2-D solved plane embedded in the 3-D viewer."
+        ),
+    )
+
+
 env = Environment(
     range_km,
     humidity_pct,
@@ -3153,13 +3614,14 @@ else:
     st.error(result["Recommendation"])
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
     [
         "Engagement Loop",
         "State Estimation",
         "Time History",
         "Monte Carlo",
         "Model State",
+        "3D Digital Twin",
     ]
 )
 
@@ -3233,7 +3695,7 @@ with tab1:
             "Track cross-range 1σ",
             "Track angular 1σ",
             "LOS rate",
-            "Aimpoint confidence",
+            "Aimpoint margin index",
             "Atmospheric transmission",
             "Optical depth",
             "Available engagement time",
@@ -3545,6 +4007,77 @@ with tab5:
     })
 
 
+# ============================================================
+# 3D digital twin visualization
+# ============================================================
+
+with tab6:
+    st.markdown("### Interactive 3D Digital Twin")
+
+    st.caption(
+        "This view embeds the authoritative 2-D engagement solution in a 3-D systems "
+        "visualization. The altitude control is presentation-only and does not alter "
+        "the underlying range, tracking, atmospheric, beam, power, or thermal physics."
+    )
+
+    if timeline is not None and not timeline.empty:
+        selected_step = st.slider(
+            "3D engagement time step",
+            0,
+            len(timeline) - 1,
+            len(timeline) - 1,
+            1,
+        )
+
+        d1, d2, d3, d4 = st.columns(4)
+        row_3d = timeline.iloc[selected_step]
+
+        d1.metric(
+            "Time",
+            f"{row_3d['Time (s)']:.2f} s",
+        )
+        d2.metric(
+            "Range",
+            f"{row_3d['Range (km)']:.2f} km",
+        )
+        d3.metric(
+            "Spot Diameter",
+            f"{row_3d['Spot Diameter (m)']:.2f} m",
+        )
+        d4.metric(
+            "Thermal Effect Index",
+            f"{row_3d['Estimated Thermal Effect Index']:.1%}",
+        )
+
+        twin_3d = build_3d_digital_twin_figure(
+            timeline,
+            env,
+            tgt,
+            result,
+            selected_step,
+            display_altitude_m,
+        )
+
+        st.plotly_chart(
+            twin_3d,
+            use_container_width=True,
+            config={
+                "displaylogo": False,
+                "scrollZoom": True,
+            },
+        )
+
+        st.caption(
+            "3D symbology: orange = target trajectory, bright green = beam/LOS, "
+            "orange dotted ellipse = approximate 1σ track uncertainty, green ring = "
+            "effective beam footprint, white X = CPA."
+        )
+    else:
+        st.info(
+            "No finite engagement timeline is available for the current scenario."
+        )
+
+
 st.divider()
 
 st.caption(
@@ -3553,7 +4086,9 @@ st.caption(
     "visibility-derived aerosol extinction, Rayleigh scaling, and a generic humidity "
     "term. Tracking uses sequential constant-velocity Kalman covariance propagation, "
     "and instantaneous LOS rate is computed directly from the evolving 2-D geometry. "
-    "Target response uses a lumped areal thermal model. None of these models constitute validated "
+    "Target response uses a lumped areal thermal model. The 3-D view is a visualization "
+    "layer that embeds the solved 2-D engagement plane without adding unmodeled 3-D "
+    "flight dynamics. None of these models constitute validated "
     "operational weapon-performance, lethality, or probability-of-kill predictions. "
     "The current target-speed envelope remains intentionally limited to 350 m/s."
 )
