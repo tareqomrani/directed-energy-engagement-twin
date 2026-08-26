@@ -1,0 +1,3559 @@
+import math
+import random
+from dataclasses import dataclass, asdict
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+
+st.set_page_config(
+    page_title="Directed Energy Engagement Digital Twin",
+    page_icon="⚡",
+    layout="wide",
+)
+
+# ============================================================
+# Theme: black night + digital green + fire orange
+# ============================================================
+
+HUD_GREEN = "#7CFF22"
+HUD_GREEN_BRIGHT = "#A5FF4D"
+HUD_GREEN_DIM = "#3B7A1A"
+HUD_ORANGE = "#FF7A18"
+HUD_ORANGE_BRIGHT = "#FF9D2E"
+HUD_ORANGE_DIM = "#A84300"
+HUD_TEXT = "#E9FFE1"
+HUD_MUTED = "#9DBA96"
+HUD_RED = "#FF4D3D"
+HUD_BG = "#020402"
+HUD_GRID = "#214A19"
+
+st.markdown(
+    f"""
+    <style>
+    :root {{
+        --hud-green: {HUD_GREEN};
+        --hud-green-bright: {HUD_GREEN_BRIGHT};
+        --hud-green-dim: {HUD_GREEN_DIM};
+        --hud-orange: {HUD_ORANGE};
+        --hud-orange-bright: {HUD_ORANGE_BRIGHT};
+        --hud-orange-dim: {HUD_ORANGE_DIM};
+        --hud-text: {HUD_TEXT};
+        --hud-muted: {HUD_MUTED};
+        --hud-red: {HUD_RED};
+        --hud-bg: {HUD_BG};
+    }}
+
+    html, body, [class*="css"] {{
+        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }}
+
+    .stApp {{
+        background:
+            radial-gradient(circle at 72% 8%, rgba(255,122,24,0.075), transparent 30%),
+            radial-gradient(circle at 16% 2%, rgba(124,255,34,0.045), transparent 25%),
+            linear-gradient(180deg, #010201 0%, #020502 55%, #010201 100%);
+        color: var(--hud-text);
+    }}
+
+    .block-container {{
+        max-width: 1600px;
+        padding-top: 1.3rem;
+        padding-bottom: 3rem;
+    }}
+
+    h1, h3 {{
+        color: var(--hud-green-bright) !important;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        text-shadow: 0 0 8px rgba(124,255,34,0.18);
+    }}
+
+    h2 {{
+        color: var(--hud-orange-bright) !important;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        text-shadow: 0 0 8px rgba(255,122,24,0.20);
+    }}
+
+    p, label, .stMarkdown, .stCaption {{
+        color: var(--hud-text);
+    }}
+
+    [data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #020502 0%, #061006 100%);
+        border-right: 1px solid rgba(124,255,34,0.24);
+    }}
+
+    div[data-testid="stMetric"] {{
+        background: linear-gradient(180deg, rgba(6,17,6,0.96), rgba(2,7,2,0.96));
+        border: 1px solid rgba(124,255,34,0.36);
+        border-radius: 10px;
+        padding: 12px 14px;
+        box-shadow:
+            0 0 14px rgba(124,255,34,0.05),
+            inset 0 0 18px rgba(124,255,34,0.02);
+    }}
+
+    div[data-testid="stMetricLabel"] {{
+        color: var(--hud-muted);
+    }}
+
+    div[data-testid="stMetricValue"] {{
+        color: var(--hud-orange-bright);
+        text-shadow: 0 0 6px rgba(255,122,24,0.18);
+    }}
+
+    button[data-baseweb="tab"] {{
+        color: var(--hud-muted);
+        background: rgba(4,12,4,0.72);
+        border: 1px solid rgba(124,255,34,0.16);
+        border-radius: 8px 8px 0 0;
+    }}
+
+    button[data-baseweb="tab"][aria-selected="true"] {{
+        color: var(--hud-orange-bright);
+        border-color: rgba(255,122,24,0.45);
+        box-shadow: inset 0 -2px 0 var(--hud-orange);
+    }}
+
+    .stButton > button, .stDownloadButton > button {{
+        color: #061006;
+        background: linear-gradient(180deg, #FF9D2E 0%, #FF6A00 100%);
+        border: 1px solid #FFB45C;
+        font-weight: 700;
+        border-radius: 8px;
+        box-shadow: 0 0 12px rgba(255,122,24,0.14);
+    }}
+
+    hr {{
+        border-color: rgba(124,255,34,0.18);
+    }}
+
+    footer {{
+        visibility: hidden;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+plt.rcParams.update({
+    "figure.facecolor": HUD_BG,
+    "axes.facecolor": HUD_BG,
+    "axes.edgecolor": HUD_GREEN_DIM,
+    "axes.labelcolor": HUD_TEXT,
+    "xtick.color": HUD_MUTED,
+    "ytick.color": HUD_MUTED,
+    "text.color": HUD_TEXT,
+    "grid.color": HUD_GRID,
+    "grid.alpha": 0.35,
+    "axes.titlecolor": HUD_GREEN_BRIGHT,
+})
+
+
+# ============================================================
+# Data models
+# ============================================================
+
+@dataclass
+class Environment:
+    range_km: float
+    humidity_pct: float
+    visibility_km: float
+    turbulence: float
+    wind_mps: float
+    ambient_temp_c: float
+    angstrom_exponent: float
+    humidity_absorption_km_inv_at_100pct: float
+    wind_pointing_sensitivity_urad_per_mps: float
+
+
+@dataclass
+class Target:
+    target_type: str
+    speed_mps: float
+    velocity_angle_deg: float
+    aspect_factor: float
+    maneuver_factor: float
+    characteristic_radius_m: float
+    absorptivity: float
+    areal_heat_capacity_kj_m2k: float
+    thermal_loss_coeff_kw_m2k: float
+    failure_delta_t_c: float
+    hardness_multiplier: float
+
+
+@dataclass
+class SensorState:
+    radar_quality: float
+    eo_ir_quality: float
+    data_latency_ms: float
+    dropped_measurement_rate: float
+    track_update_hz: float
+    range_measurement_sigma_m: float
+    bearing_measurement_sigma_mrad: float
+    process_accel_sigma_mps2: float
+
+
+@dataclass
+class HELState:
+    requested_optical_source_power_kw: float
+    wall_plug_efficiency: float
+    optics_efficiency: float
+    commanded_dwell_time_s: float
+    wavelength_um: float
+    beam_quality_m2: float
+    additional_half_angle_divergence_mrad: float
+    initial_beam_diameter_m: float
+    base_pointing_jitter_mrad: float
+
+
+@dataclass
+class PlatformState:
+    stored_energy_kwh: float
+    storage_max_discharge_kw: float
+    generator_power_kw: float
+    cooling_capacity_kw: float
+    coolant_temp_c: float
+    thermal_limit_c: float
+    thermal_capacitance_kj_per_c: float
+    subsystem_health: float
+
+
+# ============================================================
+# Utility functions
+# ============================================================
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def target_velocity_components_mps(tgt: Target):
+    """
+    2-D relative kinematics:
+      0 deg   = direct closing
+      90 deg  = crossing
+      180 deg = receding
+    """
+    angle = math.radians(tgt.velocity_angle_deg)
+    radial_closing_mps = tgt.speed_mps * math.cos(angle)
+    transverse_mps = tgt.speed_mps * math.sin(angle)
+    return radial_closing_mps, transverse_mps
+
+
+def instantaneous_los_rate_mrad_s(
+    position_m: np.ndarray,
+    velocity_mps: np.ndarray,
+) -> float:
+    """
+    Exact 2-D instantaneous LOS angular rate:
+
+        lambda_dot = (x * vy - y * vx) / (x^2 + y^2)
+
+    Returned as an absolute magnitude in mrad/s.
+    """
+    x, y = float(position_m[0]), float(position_m[1])
+    vx, vy = float(velocity_mps[0]), float(velocity_mps[1])
+    r2 = max(x * x + y * y, 1.0)
+    return abs((x * vy - y * vx) / r2) * 1000.0
+
+
+def line_of_sight_rate_mrad_s(env: Environment, tgt: Target) -> float:
+    radial_closing, transverse = target_velocity_components_mps(tgt)
+    position_m = np.array([env.range_km * 1000.0, 0.0], dtype=float)
+    velocity_mps = np.array([-radial_closing, transverse], dtype=float)
+    return instantaneous_los_rate_mrad_s(position_m, velocity_mps)
+
+
+def engagement_geometry(
+    env: Environment,
+    tgt: Target,
+    model_zone_range_km: float = 25.0,
+    minimum_range_m: float = 100.0,
+):
+    """
+    Constant-velocity 2-D engagement geometry.
+
+    The engagement horizon is terminated at the earliest physically relevant event:
+      1) commanded path reaches the minimum modeled range,
+      2) closest point of approach (CPA) for a closing/crossing trajectory,
+      3) exit from the circular model zone for a receding trajectory.
+
+    This prevents the model from "continuing through" the defended point and counting
+    post-CPA time as useful engagement time.
+    """
+    r0 = np.array([env.range_km * 1000.0, 0.0], dtype=float)
+    radial_closing, transverse = target_velocity_components_mps(tgt)
+    v = np.array([-radial_closing, transverse], dtype=float)
+
+    speed2 = float(v @ v)
+    r0_mag = float(np.linalg.norm(r0))
+    rmax = max(model_zone_range_km * 1000.0, r0_mag)
+    rmin = max(minimum_range_m, 1.0)
+
+    if speed2 <= 1e-12:
+        return {
+            "time_to_cpa_s": float("inf"),
+            "cpa_range_m": r0_mag,
+            "time_to_min_range_s": float("inf"),
+            "time_to_zone_exit_s": float("inf"),
+            "engagement_horizon_s": float("inf"),
+        }
+
+    t_cpa = max(0.0, -float(r0 @ v) / speed2)
+    r_cpa = r0 + v * t_cpa
+    cpa_range_m = float(np.linalg.norm(r_cpa))
+
+    def circle_intersection_time(radius_m):
+        a = speed2
+        b = 2.0 * float(r0 @ v)
+        c = float(r0 @ r0) - radius_m**2
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            return float("inf")
+        root = math.sqrt(disc)
+        roots = [
+            (-b - root) / (2.0 * a),
+            (-b + root) / (2.0 * a),
+        ]
+        positive = [t for t in roots if t >= 0.0]
+        return min(positive) if positive else float("inf")
+
+    time_to_min_range_s = circle_intersection_time(rmin)
+    time_to_zone_exit_s = circle_intersection_time(rmax)
+
+    radial_closing_now, _ = target_velocity_components_mps(tgt)
+
+    if radial_closing_now > 0.0:
+        if math.isfinite(time_to_min_range_s):
+            engagement_horizon_s = min(t_cpa, time_to_min_range_s)
+        else:
+            engagement_horizon_s = t_cpa
+    else:
+        engagement_horizon_s = time_to_zone_exit_s
+
+    return {
+        "time_to_cpa_s": t_cpa,
+        "cpa_range_m": cpa_range_m,
+        "time_to_min_range_s": time_to_min_range_s,
+        "time_to_zone_exit_s": time_to_zone_exit_s,
+        "engagement_horizon_s": max(0.0, engagement_horizon_s),
+    }
+
+
+def available_engagement_time_s(
+    env: Environment,
+    tgt: Target,
+) -> float:
+    return engagement_geometry(env, tgt)["engagement_horizon_s"]
+
+
+def effective_dwell_time_s(
+    env: Environment,
+    tgt: Target,
+    hel: HELState,
+) -> float:
+    return min(
+        hel.commanded_dwell_time_s,
+        available_engagement_time_s(env, tgt),
+    )
+
+
+# ============================================================
+# Atmosphere
+# ============================================================
+
+def atmospheric_extinction(
+    env: Environment,
+    hel: HELState,
+):
+    """
+    Low-order Beer-Lambert extinction model.
+
+    Aerosol extinction is derived from meteorological visibility using the
+    Koschmieder relation at 0.55 µm and spectrally scaled by an Ångström
+    exponent. A simple Rayleigh term and a user-visible humidity absorption
+    term are added. This is still not MODTRAN or a line-by-line atmosphere.
+    """
+    wavelength_um = max(hel.wavelength_um, 0.2)
+    visibility_km = max(env.visibility_km, 0.2)
+
+    aerosol_550_km_inv = 3.912 / visibility_km
+    aerosol_km_inv = aerosol_550_km_inv * (
+        0.55 / wavelength_um
+    ) ** env.angstrom_exponent
+
+    # Generic sea-level Rayleigh extinction approximation near visible/NIR.
+    rayleigh_km_inv = 0.0116 * (
+        0.55 / wavelength_um
+    ) ** 4.0
+
+    humidity_km_inv = (
+        env.humidity_absorption_km_inv_at_100pct
+        * clamp(env.humidity_pct / 100.0)
+    )
+
+    total_extinction_km_inv = (
+        aerosol_km_inv
+        + rayleigh_km_inv
+        + humidity_km_inv
+    )
+
+    optical_depth = total_extinction_km_inv * env.range_km
+    transmission = clamp(
+        math.exp(-optical_depth),
+        0.001,
+        0.999,
+    )
+
+    return {
+        "transmission": transmission,
+        "aerosol_extinction_km_inv": aerosol_km_inv,
+        "rayleigh_extinction_km_inv": rayleigh_km_inv,
+        "humidity_extinction_km_inv": humidity_km_inv,
+        "total_extinction_km_inv": total_extinction_km_inv,
+        "optical_depth": optical_depth,
+    }
+
+
+# ============================================================
+# Sensor fusion and state-estimation covariance
+# ============================================================
+
+def detection_probability(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+) -> float:
+    """
+    Normalized sensor-performance abstraction.
+
+    Detection remains phenomenological. The tracking stage below is upgraded
+    to covariance propagation rather than a scalar-only heuristic.
+    """
+    range_factor = math.exp(-env.range_km / 18.0)
+    maneuver_penalty = 1.0 - 0.20 * tgt.maneuver_factor
+
+    radar = sensors.radar_quality * range_factor
+    eo = sensors.eo_ir_quality * min(
+        1.0,
+        env.visibility_km / max(env.range_km, 0.5),
+    )
+
+    fused = 1.0 - (1.0 - radar) * (1.0 - eo)
+    fused *= maneuver_penalty
+    fused *= 1.0 - 0.5 * sensors.dropped_measurement_rate
+
+    return clamp(fused)
+
+
+def classification_confidence(
+    p_detect: float,
+    sensors: SensorState,
+    tgt: Target,
+) -> float:
+    latency_penalty = math.exp(
+        -sensors.data_latency_ms / 1800.0
+    )
+    aspect_penalty = 0.75 + 0.25 * tgt.aspect_factor
+    return clamp(
+        p_detect
+        * latency_penalty
+        * aspect_penalty
+    )
+
+
+def cv_transition(dt: float):
+    return np.array([
+        [1.0, 0.0, dt, 0.0],
+        [0.0, 1.0, 0.0, dt],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ])
+
+
+def cv_process_noise(
+    dt: float,
+    accel_sigma_mps2: float,
+):
+    q = max(accel_sigma_mps2, 1e-6) ** 2
+    return q * np.array([
+        [dt**4 / 4.0, 0.0, dt**3 / 2.0, 0.0],
+        [0.0, dt**4 / 4.0, 0.0, dt**3 / 2.0],
+        [dt**3 / 2.0, 0.0, dt**2, 0.0],
+        [0.0, dt**3 / 2.0, 0.0, dt**2],
+    ])
+
+
+def track_measurement_covariance(
+    env: Environment,
+    sensors: SensorState,
+):
+    """Build the current Cartesian measurement covariance from sensor settings."""
+    range_m = max(env.range_km * 1000.0, 1.0)
+
+    combined_quality = clamp(
+        0.55 * sensors.radar_quality
+        + 0.45 * sensors.eo_ir_quality,
+        0.10,
+        1.0,
+    )
+
+    sigma_range = (
+        sensors.range_measurement_sigma_m
+        / combined_quality
+    )
+    sigma_bearing_rad = (
+        sensors.bearing_measurement_sigma_mrad
+        / 1000.0
+        / combined_quality
+    )
+    sigma_cross = max(
+        range_m * sigma_bearing_rad,
+        0.1,
+    )
+
+    measurement_availability = max(
+        1.0 - sensors.dropped_measurement_rate,
+        0.10,
+    )
+
+    R = np.diag([
+        sigma_range**2 / measurement_availability,
+        sigma_cross**2 / measurement_availability,
+    ])
+
+    return R, sigma_range, sigma_cross
+
+
+def initialize_track_covariance(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+):
+    """
+    Initialize a conservative 4-state covariance:
+    [radial position, cross-range position, radial velocity, cross-range velocity].
+    """
+    _, sigma_range, sigma_cross = track_measurement_covariance(
+        env,
+        sensors,
+    )
+
+    velocity_sigma_init = max(
+        tgt.speed_mps * 0.15,
+        5.0,
+    )
+
+    return np.diag([
+        (2.0 * sigma_range) ** 2,
+        (2.0 * sigma_cross) ** 2,
+        velocity_sigma_init**2,
+        velocity_sigma_init**2,
+    ])
+
+
+def kalman_covariance_step(
+    P: np.ndarray,
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+    dt_s: float,
+    measurement_update: bool,
+):
+    """
+    Sequential constant-velocity covariance propagation.
+
+    Unlike the previous implementation, P is carried from one engagement
+    timestep to the next rather than reinitialized at each range.
+    """
+    dt_s = max(float(dt_s), 0.0)
+
+    maneuver_accel_sigma = (
+        sensors.process_accel_sigma_mps2
+        * (1.0 + 2.5 * tgt.maneuver_factor)
+    )
+
+    F = cv_transition(dt_s)
+    Q = cv_process_noise(
+        dt_s,
+        maneuver_accel_sigma,
+    )
+
+    P_pred = F @ P @ F.T + Q
+
+    if measurement_update:
+        R, _, _ = track_measurement_covariance(
+            env,
+            sensors,
+        )
+
+        H = np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+        ])
+        I4 = np.eye(4)
+
+        S = H @ P_pred @ H.T + R
+        K = P_pred @ H.T @ np.linalg.inv(S)
+
+        # Joseph stabilized covariance update.
+        A = I4 - K @ H
+        P_post = A @ P_pred @ A.T + K @ R @ K.T
+    else:
+        P_post = P_pred
+
+    return P_post
+
+
+def covariance_metrics(
+    P_filter: np.ndarray,
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+):
+    """
+    Convert the sequential filter covariance into engineering metrics.
+
+    A latency-predicted covariance is used for pointing and displayed track
+    uncertainty, while the un-delayed P_filter remains the state carried
+    forward by the estimator.
+    """
+    range_m = max(env.range_km * 1000.0, 1.0)
+
+    maneuver_accel_sigma = (
+        sensors.process_accel_sigma_mps2
+        * (1.0 + 2.5 * tgt.maneuver_factor)
+    )
+
+    latency_s = max(
+        sensors.data_latency_ms / 1000.0,
+        0.0,
+    )
+
+    if latency_s > 0.0:
+        F_lat = cv_transition(latency_s)
+        Q_lat = cv_process_noise(
+            latency_s,
+            maneuver_accel_sigma,
+        )
+        P_eval = (
+            F_lat
+            @ P_filter
+            @ F_lat.T
+            + Q_lat
+        )
+    else:
+        P_eval = P_filter.copy()
+
+    radial_sigma_m = math.sqrt(
+        max(P_eval[0, 0], 0.0)
+    )
+    cross_sigma_m = math.sqrt(
+        max(P_eval[1, 1], 0.0)
+    )
+    radial_velocity_sigma_mps = math.sqrt(
+        max(P_eval[2, 2], 0.0)
+    )
+    cross_velocity_sigma_mps = math.sqrt(
+        max(P_eval[3, 3], 0.0)
+    )
+
+    angular_sigma_mrad = (
+        cross_sigma_m
+        / range_m
+        * 1000.0
+    )
+
+    target_angular_radius_mrad = (
+        tgt.characteristic_radius_m
+        / range_m
+        * 1000.0
+    )
+
+    track_quality = clamp(
+        math.exp(
+            -0.5
+            * (
+                angular_sigma_mrad
+                / 0.5
+            ) ** 2
+        )
+    )
+
+    return {
+        "filter_covariance": P_filter,
+        "latency_predicted_covariance": P_eval,
+        "radial_sigma_m": radial_sigma_m,
+        "cross_sigma_m": cross_sigma_m,
+        "radial_velocity_sigma_mps": radial_velocity_sigma_mps,
+        "cross_velocity_sigma_mps": cross_velocity_sigma_mps,
+        "angular_sigma_mrad": angular_sigma_mrad,
+        "target_angular_radius_mrad": target_angular_radius_mrad,
+        "track_quality": track_quality,
+    }
+
+
+def track_covariance_metrics(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+):
+    """
+    Convenience snapshot wrapper retained for diagnostic use only.
+
+    The authoritative engagement engine uses initialize_track_covariance(),
+    kalman_covariance_step(), and covariance_metrics() sequentially.
+    """
+    P = initialize_track_covariance(
+        env,
+        tgt,
+        sensors,
+    )
+
+    update_dt = (
+        1.0
+        / max(sensors.track_update_hz, 0.1)
+    )
+
+    for _ in range(12):
+        P = kalman_covariance_step(
+            P,
+            env,
+            tgt,
+            sensors,
+            update_dt,
+            measurement_update=True,
+        )
+
+    return covariance_metrics(
+        P,
+        env,
+        tgt,
+        sensors,
+    )
+
+
+# ============================================================
+# Pointing and beam geometry
+# ============================================================
+
+def pointing_jitter_mrad(
+    env: Environment,
+    hel: HELState,
+    tracking_angular_sigma_mrad: float,
+) -> float:
+    wind_jitter_mrad = (
+        env.wind_mps
+        * env.wind_pointing_sensitivity_urad_per_mps
+        / 1000.0
+    )
+
+    # Low-order turbulence-induced beam wander term.
+    turbulence_wander_mrad = (
+        0.04 * env.turbulence
+    )
+
+    return math.sqrt(
+        hel.base_pointing_jitter_mrad**2
+        + wind_jitter_mrad**2
+        + turbulence_wander_mrad**2
+        + tracking_angular_sigma_mrad**2
+    )
+
+
+def beam_spot_geometry(
+    env: Environment,
+    hel: HELState,
+    combined_pointing_sigma_mrad: float,
+):
+    """
+    Low-order effective spot model.
+
+    Diffraction uses a Gaussian-beam half-angle approximation:
+        theta ~= M^2 * lambda / (pi * w0)
+
+    It is RSS-combined with a user-specified additional half-angle spread and
+    pointing / track uncertainty.
+    """
+    range_m = env.range_km * 1000.0
+    wavelength_m = hel.wavelength_um * 1e-6
+    w0_m = max(
+        hel.initial_beam_diameter_m / 2.0,
+        1e-4,
+    )
+
+    diffraction_half_angle_rad = (
+        hel.beam_quality_m2
+        * wavelength_m
+        / (math.pi * w0_m)
+    )
+
+    additional_half_angle_rad = (
+        hel.additional_half_angle_divergence_mrad
+        / 1000.0
+    )
+
+    turbulence_spread_rad = (
+        0.025 * env.turbulence
+        / 1000.0
+    )
+
+    effective_divergence_rad = math.sqrt(
+        diffraction_half_angle_rad**2
+        + additional_half_angle_rad**2
+        + turbulence_spread_rad**2
+    )
+
+    pointing_sigma_rad = (
+        combined_pointing_sigma_mrad
+        / 1000.0
+    )
+
+    divergence_radius_m = (
+        effective_divergence_rad * range_m
+    )
+    pointing_radius_m = (
+        pointing_sigma_rad * range_m
+    )
+
+    spot_radius_m = math.sqrt(
+        w0_m**2
+        + divergence_radius_m**2
+        + pointing_radius_m**2
+    )
+
+    spot_area_m2 = max(
+        math.pi * spot_radius_m**2,
+        1e-8,
+    )
+
+    return {
+        "diffraction_half_angle_mrad": (
+            diffraction_half_angle_rad * 1000.0
+        ),
+        "effective_half_angle_divergence_mrad": (
+            effective_divergence_rad * 1000.0
+        ),
+        "spot_radius_m": spot_radius_m,
+        "spot_diameter_m": 2.0 * spot_radius_m,
+        "spot_area_m2": spot_area_m2,
+    }
+
+
+def aimpoint_margin_index(
+    env: Environment,
+    tgt: Target,
+    combined_pointing_sigma_mrad: float,
+) -> float:
+    """
+    Dimensionless margin index based on angular target radius relative to
+    combined 1-sigma pointing / track uncertainty. It is not a probability.
+    """
+    range_m = max(
+        env.range_km * 1000.0,
+        1.0,
+    )
+    allowable_mrad = max(
+        tgt.characteristic_radius_m
+        / range_m
+        * 1000.0,
+        0.005,
+    )
+
+    ratio = (
+        combined_pointing_sigma_mrad
+        / allowable_mrad
+    )
+
+    return clamp(
+        math.exp(-0.5 * ratio**2)
+    )
+
+
+# ============================================================
+# Power and platform thermal response
+# ============================================================
+
+def requested_electrical_input_kw(
+    hel: HELState,
+) -> float:
+    return (
+        hel.requested_optical_source_power_kw
+        / max(
+            hel.wall_plug_efficiency,
+            1e-6,
+        )
+    )
+
+
+def power_and_thermal_response(
+    platform: PlatformState,
+    hel: HELState,
+    env: Environment,
+    dwell_s: float,
+):
+    """
+    Enforces:
+      generator power
+      storage discharge-power limit
+      stored-energy limit
+      wall-plug efficiency
+
+    Cooling is an ambient-limited lumped model.
+    """
+    requested_electrical_kw = (
+        requested_electrical_input_kw(hel)
+    )
+
+    energy_limited_storage_kw = (
+        platform.stored_energy_kwh
+        * 3600.0
+        / max(dwell_s, 1e-6)
+    )
+
+    storage_available_kw = min(
+        platform.storage_max_discharge_kw,
+        energy_limited_storage_kw,
+    )
+
+    total_available_kw = (
+        platform.generator_power_kw
+        + storage_available_kw
+    )
+
+    actual_electrical_kw = min(
+        requested_electrical_kw,
+        total_available_kw,
+    )
+
+    actual_optical_kw = (
+        actual_electrical_kw
+        * hel.wall_plug_efficiency
+    )
+
+    generator_contribution_kw = min(
+        platform.generator_power_kw,
+        actual_electrical_kw,
+    )
+
+    storage_draw_kw = max(
+        0.0,
+        actual_electrical_kw
+        - generator_contribution_kw,
+    )
+
+    storage_energy_used_kwh = (
+        storage_draw_kw
+        * dwell_s
+        / 3600.0
+    )
+
+    energy_remaining_kwh = max(
+        0.0,
+        platform.stored_energy_kwh
+        - storage_energy_used_kwh,
+    )
+
+    conversion_heat_kw = max(
+        0.0,
+        actual_electrical_kw
+        - actual_optical_kw,
+    )
+
+    # Conservative assumption that optical-train inefficiency is absorbed
+    # internally. This is intentionally visible in the model documentation.
+    optical_train_heat_kw = max(
+        0.0,
+        actual_optical_kw
+        * (1.0 - hel.optics_efficiency),
+    )
+
+    internal_heat_kw = (
+        conversion_heat_kw
+        + optical_train_heat_kw
+    )
+
+    temperature_headroom_c = max(
+        platform.thermal_limit_c
+        - env.ambient_temp_c,
+        1.0,
+    )
+
+    cooling_effectiveness = clamp(
+        (
+            platform.coolant_temp_c
+            - env.ambient_temp_c
+        )
+        / temperature_headroom_c
+    )
+
+    cooling_removed_kw = (
+        platform.cooling_capacity_kw
+        * cooling_effectiveness
+    )
+
+    net_heat_kw = (
+        internal_heat_kw
+        - cooling_removed_kw
+    )
+
+    delta_t_c = (
+        net_heat_kw
+        * dwell_s
+        / max(
+            platform.thermal_capacitance_kj_per_c,
+            1e-6,
+        )
+    )
+
+    new_temp_c = max(
+        env.ambient_temp_c,
+        platform.coolant_temp_c
+        + delta_t_c,
+    )
+
+    thermal_margin = clamp(
+        (
+            platform.thermal_limit_c
+            - new_temp_c
+        )
+        / max(
+            platform.thermal_limit_c
+            - env.ambient_temp_c,
+            1e-6,
+        )
+    )
+
+    energy_margin = clamp(
+        energy_remaining_kwh
+        / max(
+            platform.stored_energy_kwh,
+            1e-6,
+        )
+    )
+
+    power_availability_ratio = clamp(
+        total_available_kw
+        / max(
+            requested_electrical_kw,
+            1e-6,
+        )
+    )
+
+    return {
+        "requested_electrical_kw": requested_electrical_kw,
+        "actual_electrical_kw": actual_electrical_kw,
+        "actual_optical_kw": actual_optical_kw,
+        "generator_contribution_kw": generator_contribution_kw,
+        "storage_available_kw": storage_available_kw,
+        "storage_draw_kw": storage_draw_kw,
+        "storage_energy_used_kwh": storage_energy_used_kwh,
+        "energy_remaining_kwh": energy_remaining_kwh,
+        "conversion_heat_kw": conversion_heat_kw,
+        "optical_train_heat_kw": optical_train_heat_kw,
+        "internal_heat_kw": internal_heat_kw,
+        "cooling_removed_kw": cooling_removed_kw,
+        "net_heat_kw": net_heat_kw,
+        "new_temp_c": new_temp_c,
+        "thermal_margin": thermal_margin,
+        "energy_margin": energy_margin,
+        "power_availability_ratio": power_availability_ratio,
+    }
+
+
+# ============================================================
+# Target thermal response
+# ============================================================
+
+def target_thermal_response(
+    average_irradiance_kw_m2: float,
+    dwell_s: float,
+    env: Environment,
+    tgt: Target,
+):
+    """
+    Generic lumped surface thermal-response model.
+
+        C_A * dT/dt = alpha * I - h_A * (T - T_ambient)
+
+    where:
+      C_A = areal heat capacity [kJ/m²-K]
+      I   = average incident irradiance [kW/m²]
+      h_A = effective thermal-loss coefficient [kW/m²-K]
+
+    The resulting effect index is the modeled temperature rise normalized
+    against a user-visible synthetic failure-temperature rise. It is not a
+    damage probability.
+    """
+    c_areal = max(
+        tgt.areal_heat_capacity_kj_m2k,
+        1e-6,
+    )
+
+    q_absorbed_kw_m2 = (
+        clamp(tgt.absorptivity)
+        * max(
+            average_irradiance_kw_m2,
+            0.0,
+        )
+    )
+
+    h_loss = max(
+        tgt.thermal_loss_coeff_kw_m2k,
+        0.0,
+    )
+
+    if h_loss > 1e-9:
+        thermal_time_constant_s = (
+            c_areal / h_loss
+        )
+        steady_delta_t_c = (
+            q_absorbed_kw_m2
+            / h_loss
+        )
+        delta_t_c = (
+            steady_delta_t_c
+            * (
+                1.0
+                - math.exp(
+                    -dwell_s
+                    / thermal_time_constant_s
+                )
+            )
+        )
+    else:
+        thermal_time_constant_s = float("inf")
+        delta_t_c = (
+            q_absorbed_kw_m2
+            * dwell_s
+            / c_areal
+        )
+
+    target_surface_temp_c = (
+        env.ambient_temp_c
+        + delta_t_c
+    )
+
+    failure_delta_t_effective_c = (
+        tgt.failure_delta_t_c
+        * max(
+            tgt.hardness_multiplier,
+            0.1,
+        )
+    )
+
+    thermal_effect_index = clamp(
+        delta_t_c
+        / max(
+            failure_delta_t_effective_c,
+            1e-6,
+        )
+    )
+
+    absorbed_exposure_kj_m2 = (
+        q_absorbed_kw_m2
+        * dwell_s
+    )
+
+    return {
+        "absorbed_heat_flux_kw_m2": q_absorbed_kw_m2,
+        "absorbed_exposure_kj_m2": absorbed_exposure_kj_m2,
+        "thermal_time_constant_s": thermal_time_constant_s,
+        "target_delta_t_c": delta_t_c,
+        "target_surface_temp_c": target_surface_temp_c,
+        "effective_failure_delta_t_c": failure_delta_t_effective_c,
+        "thermal_effect_index": thermal_effect_index,
+    }
+
+
+# ============================================================
+# Coupled engagement model
+# ============================================================
+
+def readiness_score(
+    p_detect,
+    class_conf,
+    track_quality,
+    thermal_effect_index,
+    thermal_margin,
+    energy_margin,
+    power_availability_ratio,
+    health,
+):
+    """
+    Readiness score deliberately excludes the aimpoint-margin index.
+
+    Pointing / tracking uncertainty already reduces delivered irradiance through the
+    effective spot-size model. Keeping the aimpoint margin as a hard decision gate,
+    rather than another weighted term, avoids double-counting the same degradation.
+    """
+    return clamp(
+        0.10 * p_detect
+        + 0.10 * class_conf
+        + 0.18 * track_quality
+        + 0.28 * thermal_effect_index
+        + 0.11 * thermal_margin
+        + 0.08 * energy_margin
+        + 0.07 * power_availability_ratio
+        + 0.08 * health
+    )
+
+
+def engagement_recommendation(
+    score,
+    track_quality,
+    aim_margin_index,
+    thermal_margin,
+    energy_margin,
+    power_availability_ratio,
+    dwell_s,
+):
+    if dwell_s <= 0.1:
+        return "HOLD: Insufficient engagement time"
+    if power_availability_ratio < 0.60:
+        return "HOLD: Power-limited state"
+    if thermal_margin < 0.12:
+        return "HOLD: Thermal constraint"
+    if energy_margin < 0.10:
+        return "HOLD: Energy reserve constraint"
+    if track_quality < 0.45:
+        return "TRACK: Improve state estimate"
+    if aim_margin_index < 0.20:
+        return "HOLD: Aimpoint margin constraint"
+    if score >= 0.75:
+        return "ENGAGE / CONTINUE"
+    if score >= 0.55:
+        return "CAUTION: Marginal engagement"
+    return "HOLD / REASSESS"
+
+
+def simulate_static_snapshot(
+    env,
+    tgt,
+    sensors,
+    hel,
+    platform,
+    noise=True,
+):
+    if noise:
+        env = Environment(
+            range_km=max(
+                0.1,
+                random.gauss(
+                    env.range_km,
+                    0.04 * env.range_km,
+                ),
+            ),
+            humidity_pct=clamp(
+                random.gauss(
+                    env.humidity_pct,
+                    3.0,
+                ),
+                0.0,
+                100.0,
+            ),
+            visibility_km=max(
+                0.5,
+                random.gauss(
+                    env.visibility_km,
+                    0.08 * env.visibility_km,
+                ),
+            ),
+            turbulence=clamp(
+                random.gauss(
+                    env.turbulence,
+                    0.05,
+                )
+            ),
+            wind_mps=max(
+                0.0,
+                random.gauss(
+                    env.wind_mps,
+                    1.0,
+                ),
+            ),
+            ambient_temp_c=random.gauss(
+                env.ambient_temp_c,
+                1.0,
+            ),
+            angstrom_exponent=max(
+                0.0,
+                random.gauss(
+                    env.angstrom_exponent,
+                    0.10,
+                ),
+            ),
+            humidity_absorption_km_inv_at_100pct=max(
+                0.0,
+                random.gauss(
+                    env.humidity_absorption_km_inv_at_100pct,
+                    0.002,
+                ),
+            ),
+            wind_pointing_sensitivity_urad_per_mps=(
+                env.wind_pointing_sensitivity_urad_per_mps
+            ),
+        )
+
+        tgt = Target(
+            target_type=tgt.target_type,
+            speed_mps=max(
+                1.0,
+                random.gauss(
+                    tgt.speed_mps,
+                    0.03 * tgt.speed_mps,
+                ),
+            ),
+            velocity_angle_deg=clamp(
+                random.gauss(
+                    tgt.velocity_angle_deg,
+                    3.0,
+                ),
+                0.0,
+                180.0,
+            ),
+            aspect_factor=clamp(
+                random.gauss(
+                    tgt.aspect_factor,
+                    0.04,
+                ),
+                0.2,
+                1.0,
+            ),
+            maneuver_factor=clamp(
+                random.gauss(
+                    tgt.maneuver_factor,
+                    0.05,
+                )
+            ),
+            characteristic_radius_m=max(
+                0.05,
+                random.gauss(
+                    tgt.characteristic_radius_m,
+                    0.05 * tgt.characteristic_radius_m,
+                ),
+            ),
+            absorptivity=clamp(
+                random.gauss(
+                    tgt.absorptivity,
+                    0.04,
+                ),
+                0.05,
+                0.95,
+            ),
+            areal_heat_capacity_kj_m2k=max(
+                0.1,
+                random.gauss(
+                    tgt.areal_heat_capacity_kj_m2k,
+                    0.08 * tgt.areal_heat_capacity_kj_m2k,
+                ),
+            ),
+            thermal_loss_coeff_kw_m2k=max(
+                0.0,
+                random.gauss(
+                    tgt.thermal_loss_coeff_kw_m2k,
+                    0.10 * max(tgt.thermal_loss_coeff_kw_m2k, 0.01),
+                ),
+            ),
+            failure_delta_t_c=max(
+                10.0,
+                random.gauss(
+                    tgt.failure_delta_t_c,
+                    0.08 * tgt.failure_delta_t_c,
+                ),
+            ),
+            hardness_multiplier=max(
+                0.1,
+                random.gauss(
+                    tgt.hardness_multiplier,
+                    0.08 * tgt.hardness_multiplier,
+                ),
+            ),
+        )
+
+        sensors = SensorState(
+            radar_quality=clamp(
+                random.gauss(
+                    sensors.radar_quality,
+                    0.03,
+                )
+            ),
+            eo_ir_quality=clamp(
+                random.gauss(
+                    sensors.eo_ir_quality,
+                    0.03,
+                )
+            ),
+            data_latency_ms=max(
+                0.0,
+                random.gauss(
+                    sensors.data_latency_ms,
+                    20.0,
+                ),
+            ),
+            dropped_measurement_rate=clamp(
+                random.gauss(
+                    sensors.dropped_measurement_rate,
+                    0.01,
+                ),
+                0.0,
+                0.5,
+            ),
+            track_update_hz=max(
+                0.5,
+                random.gauss(
+                    sensors.track_update_hz,
+                    0.05 * sensors.track_update_hz,
+                ),
+            ),
+            range_measurement_sigma_m=max(
+                0.1,
+                random.gauss(
+                    sensors.range_measurement_sigma_m,
+                    0.08 * sensors.range_measurement_sigma_m,
+                ),
+            ),
+            bearing_measurement_sigma_mrad=max(
+                0.001,
+                random.gauss(
+                    sensors.bearing_measurement_sigma_mrad,
+                    0.08 * sensors.bearing_measurement_sigma_mrad,
+                ),
+            ),
+            process_accel_sigma_mps2=max(
+                0.01,
+                random.gauss(
+                    sensors.process_accel_sigma_mps2,
+                    0.10 * sensors.process_accel_sigma_mps2,
+                ),
+            ),
+        )
+
+        hel = HELState(
+            requested_optical_source_power_kw=max(
+                1.0,
+                random.gauss(
+                    hel.requested_optical_source_power_kw,
+                    0.02 * hel.requested_optical_source_power_kw,
+                ),
+            ),
+            wall_plug_efficiency=clamp(
+                random.gauss(
+                    hel.wall_plug_efficiency,
+                    0.02,
+                ),
+                0.05,
+                0.90,
+            ),
+            optics_efficiency=clamp(
+                random.gauss(
+                    hel.optics_efficiency,
+                    0.02,
+                ),
+                0.05,
+                1.0,
+            ),
+            commanded_dwell_time_s=hel.commanded_dwell_time_s,
+            wavelength_um=hel.wavelength_um,
+            beam_quality_m2=max(
+                1.0,
+                random.gauss(
+                    hel.beam_quality_m2,
+                    0.04 * hel.beam_quality_m2,
+                ),
+            ),
+            additional_half_angle_divergence_mrad=max(
+                0.0,
+                random.gauss(
+                    hel.additional_half_angle_divergence_mrad,
+                    0.08 * max(
+                        hel.additional_half_angle_divergence_mrad,
+                        0.005,
+                    ),
+                ),
+            ),
+            initial_beam_diameter_m=hel.initial_beam_diameter_m,
+            base_pointing_jitter_mrad=max(
+                0.0,
+                random.gauss(
+                    hel.base_pointing_jitter_mrad,
+                    0.01,
+                ),
+            ),
+        )
+
+        platform = PlatformState(
+            stored_energy_kwh=platform.stored_energy_kwh,
+            storage_max_discharge_kw=max(
+                0.0,
+                random.gauss(
+                    platform.storage_max_discharge_kw,
+                    0.04 * max(
+                        platform.storage_max_discharge_kw,
+                        1.0,
+                    ),
+                ),
+            ),
+            generator_power_kw=max(
+                0.0,
+                random.gauss(
+                    platform.generator_power_kw,
+                    0.04 * max(
+                        platform.generator_power_kw,
+                        1.0,
+                    ),
+                ),
+            ),
+            cooling_capacity_kw=max(
+                0.0,
+                random.gauss(
+                    platform.cooling_capacity_kw,
+                    0.04 * max(
+                        platform.cooling_capacity_kw,
+                        1.0,
+                    ),
+                ),
+            ),
+            coolant_temp_c=platform.coolant_temp_c,
+            thermal_limit_c=platform.thermal_limit_c,
+            thermal_capacitance_kj_per_c=max(
+                1.0,
+                random.gauss(
+                    platform.thermal_capacitance_kj_per_c,
+                    0.05 * platform.thermal_capacitance_kj_per_c,
+                ),
+            ),
+            subsystem_health=clamp(
+                random.gauss(
+                    platform.subsystem_health,
+                    0.01,
+                ),
+                0.5,
+                1.0,
+            ),
+        )
+
+    p_detect = detection_probability(
+        env,
+        tgt,
+        sensors,
+    )
+
+    class_conf = classification_confidence(
+        p_detect,
+        sensors,
+        tgt,
+    )
+
+    track = track_covariance_metrics(
+        env,
+        tgt,
+        sensors,
+    )
+
+    # Couple detection/classification confidence to covariance-derived track quality.
+    track_quality = clamp(
+        track["track_quality"]
+        * (0.65 + 0.20 * p_detect + 0.15 * class_conf)
+    )
+
+    dwell_s = effective_dwell_time_s(
+        env,
+        tgt,
+        hel,
+    )
+
+    atmosphere = atmospheric_extinction(
+        env,
+        hel,
+    )
+
+    platform_state = power_and_thermal_response(
+        platform,
+        hel,
+        env,
+        dwell_s,
+    )
+
+    combined_pointing_sigma_mrad = pointing_jitter_mrad(
+        env,
+        hel,
+        track["angular_sigma_mrad"],
+    )
+
+    beam = beam_spot_geometry(
+        env,
+        hel,
+        combined_pointing_sigma_mrad,
+    )
+
+    target_optical_power_kw = (
+        platform_state["actual_optical_kw"]
+        * hel.optics_efficiency
+        * atmosphere["transmission"]
+    )
+
+    average_irradiance_kw_m2 = (
+        target_optical_power_kw
+        / beam["spot_area_m2"]
+    )
+
+    aim_margin = aimpoint_margin_index(
+        env,
+        tgt,
+        combined_pointing_sigma_mrad,
+    )
+
+    target_thermal = target_thermal_response(
+        average_irradiance_kw_m2,
+        dwell_s,
+        env,
+        tgt,
+    )
+
+    score = readiness_score(
+        p_detect,
+        class_conf,
+        track_quality,
+        target_thermal["thermal_effect_index"],
+        platform_state["thermal_margin"],
+        platform_state["energy_margin"],
+        platform_state["power_availability_ratio"],
+        platform.subsystem_health,
+    )
+
+    recommendation = engagement_recommendation(
+        score,
+        track_quality,
+        aim_margin,
+        platform_state["thermal_margin"],
+        platform_state["energy_margin"],
+        platform_state["power_availability_ratio"],
+        dwell_s,
+    )
+
+    return {
+        "Detection Probability": p_detect,
+        "Classification Confidence": class_conf,
+        "Track Quality": track_quality,
+        "Track Cross-Range 1σ (m)": track["cross_sigma_m"],
+        "Track Radial 1σ (m)": track["radial_sigma_m"],
+        "Track Angular 1σ (mrad)": track["angular_sigma_mrad"],
+        "Target Angular Radius (mrad)": track["target_angular_radius_mrad"],
+        "LOS Rate (mrad/s)": line_of_sight_rate_mrad_s(env, tgt),
+        "Aimpoint Margin Index": aim_margin,
+        "Atmospheric Transmission": atmosphere["transmission"],
+        "Aerosol Extinction (1/km)": atmosphere["aerosol_extinction_km_inv"],
+        "Rayleigh Extinction (1/km)": atmosphere["rayleigh_extinction_km_inv"],
+        "Humidity Extinction (1/km)": atmosphere["humidity_extinction_km_inv"],
+        "Optical Depth": atmosphere["optical_depth"],
+        "Available Engagement Time (s)": available_engagement_time_s(env, tgt),
+        "Time to CPA (s)": engagement_geometry(env, tgt)["time_to_cpa_s"],
+        "CPA Range (m)": engagement_geometry(env, tgt)["cpa_range_m"],
+        "Effective Dwell Time (s)": dwell_s,
+        "Requested Optical Source Power (kW)": hel.requested_optical_source_power_kw,
+        "Actual Optical Source Power (kW)": platform_state["actual_optical_kw"],
+        "Requested Electrical Input (kW)": platform_state["requested_electrical_kw"],
+        "Actual Electrical Input (kW)": platform_state["actual_electrical_kw"],
+        "Power Availability Ratio": platform_state["power_availability_ratio"],
+        "Generator Contribution (kW)": platform_state["generator_contribution_kw"],
+        "Storage Draw (kW)": platform_state["storage_draw_kw"],
+        "Target Optical Power (kW)": target_optical_power_kw,
+        "Diffraction Half-Angle (mrad)": beam["diffraction_half_angle_mrad"],
+        "Effective Beam Half-Angle (mrad)": beam["effective_half_angle_divergence_mrad"],
+        "Combined Pointing 1σ (mrad)": combined_pointing_sigma_mrad,
+        "Spot Diameter (m)": beam["spot_diameter_m"],
+        "Average Irradiance (kW/m^2)": average_irradiance_kw_m2,
+        "Absorbed Heat Flux (kW/m^2)": target_thermal["absorbed_heat_flux_kw_m2"],
+        "Absorbed Exposure (kJ/m^2)": target_thermal["absorbed_exposure_kj_m2"],
+        "Target ΔT (C)": target_thermal["target_delta_t_c"],
+        "Target Surface Temp (C)": target_thermal["target_surface_temp_c"],
+        "Target Thermal Time Constant (s)": target_thermal["thermal_time_constant_s"],
+        "Estimated Thermal Effect Index": target_thermal["thermal_effect_index"],
+        "Coolant Temp After Dwell (C)": platform_state["new_temp_c"],
+        "Thermal Margin": platform_state["thermal_margin"],
+        "Energy Margin": platform_state["energy_margin"],
+        "Storage Energy Used (kWh)": platform_state["storage_energy_used_kwh"],
+        "Internal Heat (kW)": platform_state["internal_heat_kw"],
+        "Cooling Removed (kW)": platform_state["cooling_removed_kw"],
+        "Net Heat Load (kW)": platform_state["net_heat_kw"],
+        "Readiness Score": score,
+        "Recommendation": recommendation,
+    }
+
+
+def engagement_timeline(
+    env,
+    tgt,
+    sensors,
+    hel,
+    platform,
+    steps=50,
+):
+    horizon = min(
+        hel.commanded_dwell_time_s,
+        available_engagement_time_s(env, tgt),
+    )
+    if not math.isfinite(horizon):
+        horizon = hel.commanded_dwell_time_s
+
+    dt_s = max(
+        horizon / max(steps, 1),
+        0.02,
+    )
+
+    timeline, _ = simulate_time_stepped_engagement(
+        env,
+        tgt,
+        sensors,
+        hel,
+        platform,
+        dt_s=dt_s,
+    )
+
+    if timeline.empty:
+        return pd.DataFrame({
+            "Time (s)": [0.0],
+            "Range (km)": [env.range_km],
+            "Estimated Thermal Effect Index": [0.0],
+            "Target Surface Temp (C)": [env.ambient_temp_c],
+            "Coolant Temp (C)": [platform.coolant_temp_c],
+            "Stored Energy Remaining (kWh)": [platform.stored_energy_kwh],
+            "Average Irradiance (kW/m^2)": [0.0],
+        })
+
+    return timeline
+
+
+
+def simulate_time_stepped_engagement(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+    hel: HELState,
+    platform: PlatformState,
+    dt_s: float = 0.10,
+):
+    """
+    Authoritative engagement engine.
+
+    The target moves continuously under constant-velocity 2-D kinematics.
+    The Kalman covariance is propagated sequentially across engagement time.
+    Each step recomputes atmosphere, beam geometry, irradiance, target thermal
+    state, power/energy state, and platform thermal state.
+
+    The returned final-state dictionary is the single source of truth used by
+    the dashboard, recommendations, Monte Carlo analysis, JSON state, and plots.
+    """
+    geometry = engagement_geometry(
+        env,
+        tgt,
+    )
+    horizon_s = geometry["engagement_horizon_s"]
+
+    total_time_s = min(
+        hel.commanded_dwell_time_s,
+        horizon_s,
+    )
+
+    if not math.isfinite(total_time_s):
+        total_time_s = (
+            hel.commanded_dwell_time_s
+        )
+
+    total_time_s = max(
+        0.0,
+        total_time_s,
+    )
+
+    if total_time_s <= 0.0:
+        return pd.DataFrame(), {
+            "Detection Probability": 0.0,
+            "Classification Confidence": 0.0,
+            "Track Quality": 0.0,
+            "Track Cross-Range 1σ (m)": float("nan"),
+            "Track Radial 1σ (m)": float("nan"),
+            "Track Angular 1σ (mrad)": float("nan"),
+            "Target Angular Radius (mrad)": (
+                tgt.characteristic_radius_m
+                / max(env.range_km * 1000.0, 1.0)
+                * 1000.0
+            ),
+            "LOS Rate (mrad/s)": line_of_sight_rate_mrad_s(env, tgt),
+            "Aimpoint Margin Index": 0.0,
+            "Atmospheric Transmission": atmospheric_extinction(env, hel)["transmission"],
+            "Aerosol Extinction (1/km)": atmospheric_extinction(env, hel)["aerosol_extinction_km_inv"],
+            "Rayleigh Extinction (1/km)": atmospheric_extinction(env, hel)["rayleigh_extinction_km_inv"],
+            "Humidity Extinction (1/km)": atmospheric_extinction(env, hel)["humidity_extinction_km_inv"],
+            "Optical Depth": atmospheric_extinction(env, hel)["optical_depth"],
+            "Available Engagement Time (s)": 0.0,
+            "Time to CPA (s)": geometry["time_to_cpa_s"],
+            "CPA Range (m)": geometry["cpa_range_m"],
+            "Effective Dwell Time (s)": 0.0,
+            "Requested Optical Source Power (kW)": hel.requested_optical_source_power_kw,
+            "Actual Optical Source Power (kW)": 0.0,
+            "Requested Electrical Input (kW)": requested_electrical_input_kw(hel),
+            "Actual Electrical Input (kW)": 0.0,
+            "Power Availability Ratio": 0.0,
+            "Generator Contribution (kW)": 0.0,
+            "Storage Draw (kW)": 0.0,
+            "Target Optical Power (kW)": 0.0,
+            "Diffraction Half-Angle (mrad)": 0.0,
+            "Effective Beam Half-Angle (mrad)": 0.0,
+            "Combined Pointing 1σ (mrad)": float("nan"),
+            "Spot Diameter (m)": float("nan"),
+            "Average Irradiance (kW/m^2)": 0.0,
+            "Absorbed Heat Flux (kW/m^2)": 0.0,
+            "Absorbed Exposure (kJ/m^2)": 0.0,
+            "Target ΔT (C)": 0.0,
+            "Target Surface Temp (C)": env.ambient_temp_c,
+            "Target Thermal Time Constant (s)": float("inf"),
+            "Estimated Thermal Effect Index": 0.0,
+            "Coolant Temp After Dwell (C)": platform.coolant_temp_c,
+            "Thermal Margin": 1.0,
+            "Energy Margin": 1.0,
+            "Storage Energy Used (kWh)": 0.0,
+            "Internal Heat (kW)": 0.0,
+            "Cooling Removed (kW)": 0.0,
+            "Net Heat Load (kW)": 0.0,
+            "Readiness Score": 0.0,
+            "Recommendation": "HOLD: Insufficient engagement time",
+            "Final Range (km)": env.range_km,
+        }
+
+    integration_dt = max(
+        min(
+            float(dt_s),
+            1.0 / max(
+                sensors.track_update_hz,
+                0.1,
+            ),
+        ),
+        0.01,
+    )
+
+    steps = max(
+        1,
+        int(
+            math.ceil(
+                total_time_s
+                / integration_dt
+            )
+        ),
+    )
+    dt_actual = (
+        total_time_s / steps
+    )
+
+    radial_closing, transverse = (
+        target_velocity_components_mps(tgt)
+    )
+    r0 = np.array(
+        [
+            env.range_km * 1000.0,
+            0.0,
+        ],
+        dtype=float,
+    )
+    velocity_mps = np.array(
+        [
+            -radial_closing,
+            transverse,
+        ],
+        dtype=float,
+    )
+
+    target_temp_c = env.ambient_temp_c
+    coolant_temp_c = platform.coolant_temp_c
+    stored_energy_kwh = platform.stored_energy_kwh
+    absorbed_exposure_kj_m2 = 0.0
+
+    P_filter = initialize_track_covariance(
+        env,
+        tgt,
+        sensors,
+    )
+
+    measurement_period_s = (
+        1.0
+        / max(
+            sensors.track_update_hz,
+            0.1,
+        )
+    )
+    measurement_accumulator_s = (
+        measurement_period_s
+    )
+
+    rows = []
+
+    for k in range(steps):
+        t_mid = (
+            (k + 0.5)
+            * dt_actual
+        )
+        elapsed_s = (
+            (k + 1)
+            * dt_actual
+        )
+
+        position_m = (
+            r0
+            + velocity_mps * t_mid
+        )
+        range_m = max(
+            float(
+                np.linalg.norm(position_m)
+            ),
+            1.0,
+        )
+        range_km = (
+            range_m / 1000.0
+        )
+
+        step_env = Environment(
+            range_km=range_km,
+            humidity_pct=env.humidity_pct,
+            visibility_km=env.visibility_km,
+            turbulence=env.turbulence,
+            wind_mps=env.wind_mps,
+            ambient_temp_c=env.ambient_temp_c,
+            angstrom_exponent=env.angstrom_exponent,
+            humidity_absorption_km_inv_at_100pct=env.humidity_absorption_km_inv_at_100pct,
+            wind_pointing_sensitivity_urad_per_mps=env.wind_pointing_sensitivity_urad_per_mps,
+        )
+
+        step_platform = PlatformState(
+            stored_energy_kwh=stored_energy_kwh,
+            storage_max_discharge_kw=platform.storage_max_discharge_kw,
+            generator_power_kw=platform.generator_power_kw,
+            cooling_capacity_kw=platform.cooling_capacity_kw,
+            coolant_temp_c=coolant_temp_c,
+            thermal_limit_c=platform.thermal_limit_c,
+            thermal_capacitance_kj_per_c=platform.thermal_capacitance_kj_per_c,
+            subsystem_health=platform.subsystem_health,
+        )
+
+        p_detect = detection_probability(
+            step_env,
+            tgt,
+            sensors,
+        )
+        class_conf = classification_confidence(
+            p_detect,
+            sensors,
+            tgt,
+        )
+
+        measurement_accumulator_s += dt_actual
+        do_measurement_update = (
+            measurement_accumulator_s
+            + 1e-12
+            >= measurement_period_s
+        )
+
+        P_filter = kalman_covariance_step(
+            P_filter,
+            step_env,
+            tgt,
+            sensors,
+            dt_actual,
+            measurement_update=do_measurement_update,
+        )
+
+        if do_measurement_update:
+            measurement_accumulator_s = (
+                measurement_accumulator_s
+                - measurement_period_s
+            )
+
+        track = covariance_metrics(
+            P_filter,
+            step_env,
+            tgt,
+            sensors,
+        )
+
+        track_quality = clamp(
+            track["track_quality"]
+            * (
+                0.65
+                + 0.20 * p_detect
+                + 0.15 * class_conf
+            )
+        )
+
+        atmosphere = atmospheric_extinction(
+            step_env,
+            hel,
+        )
+
+        step_power = power_and_thermal_response(
+            step_platform,
+            hel,
+            step_env,
+            dt_actual,
+        )
+
+        combined_pointing_sigma_mrad = (
+            pointing_jitter_mrad(
+                step_env,
+                hel,
+                track["angular_sigma_mrad"],
+            )
+        )
+
+        beam = beam_spot_geometry(
+            step_env,
+            hel,
+            combined_pointing_sigma_mrad,
+        )
+
+        target_optical_power_kw = (
+            step_power["actual_optical_kw"]
+            * hel.optics_efficiency
+            * atmosphere["transmission"]
+        )
+
+        average_irradiance_kw_m2 = (
+            target_optical_power_kw
+            / beam["spot_area_m2"]
+        )
+
+        aim_margin = aimpoint_margin_index(
+            step_env,
+            tgt,
+            combined_pointing_sigma_mrad,
+        )
+
+        c_areal = max(
+            tgt.areal_heat_capacity_kj_m2k,
+            1e-6,
+        )
+        absorbed_flux_kw_m2 = (
+            clamp(tgt.absorptivity)
+            * max(
+                average_irradiance_kw_m2,
+                0.0,
+            )
+        )
+        h_loss = max(
+            tgt.thermal_loss_coeff_kw_m2k,
+            0.0,
+        )
+        heat_loss_kw_m2 = (
+            h_loss
+            * max(
+                target_temp_c
+                - env.ambient_temp_c,
+                0.0,
+            )
+        )
+
+        target_delta_t_step_c = (
+            (
+                absorbed_flux_kw_m2
+                - heat_loss_kw_m2
+            )
+            * dt_actual
+            / c_areal
+        )
+
+        target_temp_c = max(
+            env.ambient_temp_c,
+            target_temp_c
+            + target_delta_t_step_c,
+        )
+
+        absorbed_exposure_kj_m2 += (
+            absorbed_flux_kw_m2
+            * dt_actual
+        )
+
+        target_delta_t_total_c = (
+            target_temp_c
+            - env.ambient_temp_c
+        )
+
+        effective_failure_delta_t_c = (
+            tgt.failure_delta_t_c
+            * max(
+                tgt.hardness_multiplier,
+                0.1,
+            )
+        )
+
+        thermal_effect_index = clamp(
+            target_delta_t_total_c
+            / max(
+                effective_failure_delta_t_c,
+                1e-6,
+            )
+        )
+
+        thermal_time_constant_s = (
+            c_areal / h_loss
+            if h_loss > 1e-12
+            else float("inf")
+        )
+
+        coolant_temp_c = (
+            step_power["new_temp_c"]
+        )
+        stored_energy_kwh = (
+            step_power[
+                "energy_remaining_kwh"
+            ]
+        )
+
+        energy_margin = clamp(
+            stored_energy_kwh
+            / max(
+                platform.stored_energy_kwh,
+                1e-6,
+            )
+        )
+
+        los_rate_mrad_s = (
+            instantaneous_los_rate_mrad_s(
+                position_m,
+                velocity_mps,
+            )
+        )
+
+        score = readiness_score(
+            p_detect,
+            class_conf,
+            track_quality,
+            thermal_effect_index,
+            step_power["thermal_margin"],
+            energy_margin,
+            step_power[
+                "power_availability_ratio"
+            ],
+            platform.subsystem_health,
+        )
+
+        recommendation = (
+            engagement_recommendation(
+                score,
+                track_quality,
+                aim_margin,
+                step_power[
+                    "thermal_margin"
+                ],
+                energy_margin,
+                step_power[
+                    "power_availability_ratio"
+                ],
+                elapsed_s,
+            )
+        )
+
+        state = {
+            "Time (s)": elapsed_s,
+            "Range (km)": range_km,
+            "Final Range (km)": range_km,
+            "Detection Probability": p_detect,
+            "Classification Confidence": class_conf,
+            "Track Quality": track_quality,
+            "Track Cross-Range 1σ (m)": track["cross_sigma_m"],
+            "Track Radial 1σ (m)": track["radial_sigma_m"],
+            "Track Angular 1σ (mrad)": track["angular_sigma_mrad"],
+            "Target Angular Radius (mrad)": track["target_angular_radius_mrad"],
+            "LOS Rate (mrad/s)": los_rate_mrad_s,
+            "Aimpoint Margin Index": aim_margin,
+            "Atmospheric Transmission": atmosphere["transmission"],
+            "Aerosol Extinction (1/km)": atmosphere["aerosol_extinction_km_inv"],
+            "Rayleigh Extinction (1/km)": atmosphere["rayleigh_extinction_km_inv"],
+            "Humidity Extinction (1/km)": atmosphere["humidity_extinction_km_inv"],
+            "Optical Depth": atmosphere["optical_depth"],
+            "Available Engagement Time (s)": geometry["engagement_horizon_s"],
+            "Time to CPA (s)": geometry["time_to_cpa_s"],
+            "CPA Range (m)": geometry["cpa_range_m"],
+            "Effective Dwell Time (s)": elapsed_s,
+            "Requested Optical Source Power (kW)": hel.requested_optical_source_power_kw,
+            "Actual Optical Source Power (kW)": step_power["actual_optical_kw"],
+            "Requested Electrical Input (kW)": step_power["requested_electrical_kw"],
+            "Actual Electrical Input (kW)": step_power["actual_electrical_kw"],
+            "Power Availability Ratio": step_power["power_availability_ratio"],
+            "Generator Contribution (kW)": step_power["generator_contribution_kw"],
+            "Storage Draw (kW)": step_power["storage_draw_kw"],
+            "Target Optical Power (kW)": target_optical_power_kw,
+            "Diffraction Half-Angle (mrad)": beam["diffraction_half_angle_mrad"],
+            "Effective Beam Half-Angle (mrad)": beam["effective_half_angle_divergence_mrad"],
+            "Combined Pointing 1σ (mrad)": combined_pointing_sigma_mrad,
+            "Spot Diameter (m)": beam["spot_diameter_m"],
+            "Average Irradiance (kW/m^2)": average_irradiance_kw_m2,
+            "Absorbed Heat Flux (kW/m^2)": absorbed_flux_kw_m2,
+            "Absorbed Exposure (kJ/m^2)": absorbed_exposure_kj_m2,
+            "Target ΔT (C)": target_delta_t_total_c,
+            "Target Surface Temp (C)": target_temp_c,
+            "Target Thermal Time Constant (s)": thermal_time_constant_s,
+            "Estimated Thermal Effect Index": thermal_effect_index,
+            "Coolant Temp After Dwell (C)": coolant_temp_c,
+            "Coolant Temp (C)": coolant_temp_c,
+            "Thermal Margin": step_power["thermal_margin"],
+            "Energy Margin": energy_margin,
+            "Storage Energy Used (kWh)": (
+                platform.stored_energy_kwh
+                - stored_energy_kwh
+            ),
+            "Stored Energy Remaining (kWh)": stored_energy_kwh,
+            "Internal Heat (kW)": step_power["internal_heat_kw"],
+            "Cooling Removed (kW)": step_power["cooling_removed_kw"],
+            "Net Heat Load (kW)": step_power["net_heat_kw"],
+            "Readiness Score": score,
+            "Recommendation": recommendation,
+        }
+
+        rows.append(state)
+
+    timeline = pd.DataFrame(rows)
+    final_state = dict(rows[-1])
+
+    return timeline, final_state
+
+
+def perturb_scenario(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+    hel: HELState,
+    platform: PlatformState,
+):
+    """Generate one generic uncertainty realization for dynamic Monte Carlo."""
+    p_env = Environment(
+        range_km=max(
+            0.1,
+            random.gauss(
+                env.range_km,
+                0.04 * env.range_km,
+            ),
+        ),
+        humidity_pct=clamp(
+            random.gauss(
+                env.humidity_pct,
+                3.0,
+            ),
+            0.0,
+            100.0,
+        ),
+        visibility_km=max(
+            0.5,
+            random.gauss(
+                env.visibility_km,
+                0.08 * env.visibility_km,
+            ),
+        ),
+        turbulence=clamp(
+            random.gauss(
+                env.turbulence,
+                0.05,
+            )
+        ),
+        wind_mps=max(
+            0.0,
+            random.gauss(
+                env.wind_mps,
+                1.0,
+            ),
+        ),
+        ambient_temp_c=random.gauss(
+            env.ambient_temp_c,
+            1.0,
+        ),
+        angstrom_exponent=max(
+            0.0,
+            random.gauss(
+                env.angstrom_exponent,
+                0.10,
+            ),
+        ),
+        humidity_absorption_km_inv_at_100pct=max(
+            0.0,
+            random.gauss(
+                env.humidity_absorption_km_inv_at_100pct,
+                0.002,
+            ),
+        ),
+        wind_pointing_sensitivity_urad_per_mps=env.wind_pointing_sensitivity_urad_per_mps,
+    )
+
+    p_tgt = Target(
+        target_type=tgt.target_type,
+        speed_mps=max(
+            1.0,
+            random.gauss(
+                tgt.speed_mps,
+                0.03 * tgt.speed_mps,
+            ),
+        ),
+        velocity_angle_deg=clamp(
+            random.gauss(
+                tgt.velocity_angle_deg,
+                3.0,
+            ),
+            0.0,
+            180.0,
+        ),
+        aspect_factor=clamp(
+            random.gauss(
+                tgt.aspect_factor,
+                0.04,
+            ),
+            0.2,
+            1.0,
+        ),
+        maneuver_factor=clamp(
+            random.gauss(
+                tgt.maneuver_factor,
+                0.05,
+            )
+        ),
+        characteristic_radius_m=max(
+            0.05,
+            random.gauss(
+                tgt.characteristic_radius_m,
+                0.05 * tgt.characteristic_radius_m,
+            ),
+        ),
+        absorptivity=clamp(
+            random.gauss(
+                tgt.absorptivity,
+                0.04,
+            ),
+            0.05,
+            0.95,
+        ),
+        areal_heat_capacity_kj_m2k=max(
+            0.1,
+            random.gauss(
+                tgt.areal_heat_capacity_kj_m2k,
+                0.08 * tgt.areal_heat_capacity_kj_m2k,
+            ),
+        ),
+        thermal_loss_coeff_kw_m2k=max(
+            0.0,
+            random.gauss(
+                tgt.thermal_loss_coeff_kw_m2k,
+                0.10 * max(
+                    tgt.thermal_loss_coeff_kw_m2k,
+                    0.01,
+                ),
+            ),
+        ),
+        failure_delta_t_c=max(
+            10.0,
+            random.gauss(
+                tgt.failure_delta_t_c,
+                0.08 * tgt.failure_delta_t_c,
+            ),
+        ),
+        hardness_multiplier=max(
+            0.1,
+            random.gauss(
+                tgt.hardness_multiplier,
+                0.08 * tgt.hardness_multiplier,
+            ),
+        ),
+    )
+
+    p_sensors = SensorState(
+        radar_quality=clamp(
+            random.gauss(
+                sensors.radar_quality,
+                0.03,
+            )
+        ),
+        eo_ir_quality=clamp(
+            random.gauss(
+                sensors.eo_ir_quality,
+                0.03,
+            )
+        ),
+        data_latency_ms=max(
+            0.0,
+            random.gauss(
+                sensors.data_latency_ms,
+                20.0,
+            ),
+        ),
+        dropped_measurement_rate=clamp(
+            random.gauss(
+                sensors.dropped_measurement_rate,
+                0.01,
+            ),
+            0.0,
+            0.5,
+        ),
+        track_update_hz=max(
+            0.5,
+            random.gauss(
+                sensors.track_update_hz,
+                0.05 * sensors.track_update_hz,
+            ),
+        ),
+        range_measurement_sigma_m=max(
+            0.1,
+            random.gauss(
+                sensors.range_measurement_sigma_m,
+                0.08 * sensors.range_measurement_sigma_m,
+            ),
+        ),
+        bearing_measurement_sigma_mrad=max(
+            0.001,
+            random.gauss(
+                sensors.bearing_measurement_sigma_mrad,
+                0.08 * sensors.bearing_measurement_sigma_mrad,
+            ),
+        ),
+        process_accel_sigma_mps2=max(
+            0.01,
+            random.gauss(
+                sensors.process_accel_sigma_mps2,
+                0.10 * sensors.process_accel_sigma_mps2,
+            ),
+        ),
+    )
+
+    p_hel = HELState(
+        requested_optical_source_power_kw=max(
+            1.0,
+            random.gauss(
+                hel.requested_optical_source_power_kw,
+                0.02 * hel.requested_optical_source_power_kw,
+            ),
+        ),
+        wall_plug_efficiency=clamp(
+            random.gauss(
+                hel.wall_plug_efficiency,
+                0.02,
+            ),
+            0.05,
+            0.90,
+        ),
+        optics_efficiency=clamp(
+            random.gauss(
+                hel.optics_efficiency,
+                0.02,
+            ),
+            0.05,
+            1.0,
+        ),
+        commanded_dwell_time_s=hel.commanded_dwell_time_s,
+        wavelength_um=hel.wavelength_um,
+        beam_quality_m2=max(
+            1.0,
+            random.gauss(
+                hel.beam_quality_m2,
+                0.04 * hel.beam_quality_m2,
+            ),
+        ),
+        additional_half_angle_divergence_mrad=max(
+            0.0,
+            random.gauss(
+                hel.additional_half_angle_divergence_mrad,
+                0.08 * max(
+                    hel.additional_half_angle_divergence_mrad,
+                    0.005,
+                ),
+            ),
+        ),
+        initial_beam_diameter_m=hel.initial_beam_diameter_m,
+        base_pointing_jitter_mrad=max(
+            0.0,
+            random.gauss(
+                hel.base_pointing_jitter_mrad,
+                0.01,
+            ),
+        ),
+    )
+
+    p_platform = PlatformState(
+        stored_energy_kwh=max(
+            0.1,
+            random.gauss(
+                platform.stored_energy_kwh,
+                0.02 * platform.stored_energy_kwh,
+            ),
+        ),
+        storage_max_discharge_kw=max(
+            0.0,
+            random.gauss(
+                platform.storage_max_discharge_kw,
+                0.04 * max(
+                    platform.storage_max_discharge_kw,
+                    1.0,
+                ),
+            ),
+        ),
+        generator_power_kw=max(
+            0.0,
+            random.gauss(
+                platform.generator_power_kw,
+                0.04 * max(
+                    platform.generator_power_kw,
+                    1.0,
+                ),
+            ),
+        ),
+        cooling_capacity_kw=max(
+            0.0,
+            random.gauss(
+                platform.cooling_capacity_kw,
+                0.04 * max(
+                    platform.cooling_capacity_kw,
+                    1.0,
+                ),
+            ),
+        ),
+        coolant_temp_c=platform.coolant_temp_c,
+        thermal_limit_c=platform.thermal_limit_c,
+        thermal_capacitance_kj_per_c=max(
+            1.0,
+            random.gauss(
+                platform.thermal_capacitance_kj_per_c,
+                0.05 * platform.thermal_capacitance_kj_per_c,
+            ),
+        ),
+        subsystem_health=clamp(
+            random.gauss(
+                platform.subsystem_health,
+                0.01,
+            ),
+            0.5,
+            1.0,
+        ),
+    )
+
+    return (
+        p_env,
+        p_tgt,
+        p_sensors,
+        p_hel,
+        p_platform,
+    )
+
+
+def simulate_dynamic_monte_carlo_run(
+    env,
+    tgt,
+    sensors,
+    hel,
+    platform,
+):
+    (
+        p_env,
+        p_tgt,
+        p_sensors,
+        p_hel,
+        p_platform,
+    ) = perturb_scenario(
+        env,
+        tgt,
+        sensors,
+        hel,
+        platform,
+    )
+
+    _, final_state = simulate_time_stepped_engagement(
+        p_env,
+        p_tgt,
+        p_sensors,
+        p_hel,
+        p_platform,
+        dt_s=0.10,
+    )
+
+    return final_state
+
+
+# ============================================================
+# UI
+# ============================================================
+
+st.markdown(
+    f"""
+    <div style="
+        border:1px solid rgba(124,255,34,0.42);
+        background:linear-gradient(180deg,rgba(6,17,6,.96),rgba(2,7,2,.96));
+        border-radius:10px;
+        padding:18px 22px;
+        margin-bottom:14px;
+        box-shadow:0 0 18px rgba(124,255,34,.06);
+    ">
+        <div style="
+            font-size:2rem;
+            font-weight:800;
+            letter-spacing:.045em;
+            color:{HUD_TEXT};
+        ">
+            DIRECTED ENERGY
+        </div>
+        <div style="
+            font-size:1.65rem;
+            font-weight:800;
+            letter-spacing:.045em;
+            color:{HUD_ORANGE_BRIGHT};
+            margin-top:-2px;
+        ">
+            ENGAGEMENT DIGITAL TWIN
+        </div>
+        <div style="
+            color:{HUD_MUTED};
+            letter-spacing:.08em;
+            margin-top:8px;
+            font-size:.92rem;
+        ">
+            PHYSICS-INFORMED • CLOSED-LOOP • SYSTEMS ENGINEERING
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.caption(
+    "Low-order, non-classified digital engineering prototype. "
+    "The model now includes Kalman covariance propagation, Beer-Lambert atmospheric "
+    "extinction, and a lumped target thermal-response model. Outputs remain generic "
+    "engineering estimates, not validated weapon-performance predictions."
+)
+
+
+with st.sidebar:
+    st.header("Scenario Configuration")
+
+    st.subheader("Environment")
+    range_km = st.slider(
+        "Target range (km)",
+        0.5,
+        25.0,
+        6.0,
+        0.5,
+    )
+    humidity_pct = st.slider(
+        "Relative humidity (%)",
+        0,
+        100,
+        45,
+    )
+    visibility_km = st.slider(
+        "Meteorological visibility (km)",
+        1.0,
+        40.0,
+        20.0,
+        1.0,
+    )
+    turbulence = st.slider(
+        "Turbulence index",
+        0.0,
+        1.0,
+        0.25,
+        0.05,
+    )
+    wind_mps = st.slider(
+        "Wind speed (m/s)",
+        0.0,
+        30.0,
+        5.0,
+        0.5,
+    )
+    ambient_temp_c = st.slider(
+        "Ambient temperature (°C)",
+        -20.0,
+        60.0,
+        25.0,
+        1.0,
+    )
+    angstrom_exponent = st.slider(
+        "Ångström aerosol exponent",
+        0.0,
+        2.5,
+        1.3,
+        0.1,
+        help=(
+            "Spectral aerosol-extinction scaling exponent. "
+            "This remains a low-order atmospheric abstraction."
+        ),
+    )
+    humidity_absorption_km_inv_at_100pct = st.slider(
+        "Humidity absorption coefficient at 100% RH (1/km)",
+        0.0,
+        0.10,
+        0.015,
+        0.005,
+        help=(
+            "Generic absorption term. It is not a wavelength-resolved "
+            "molecular spectroscopy model."
+        ),
+    )
+    wind_pointing_sensitivity_urad_per_mps = st.slider(
+        "Wind pointing sensitivity (µrad per m/s)",
+        0.0,
+        10.0,
+        2.0,
+        0.5,
+    )
+
+    st.subheader("Target")
+
+    TARGET_PRESETS = {
+        "Small UAS": {
+            "speed": 45.0,
+            "angle": 20.0,
+            "aspect": 0.65,
+            "maneuver": 0.55,
+            "radius": 0.30,
+            "absorptivity": 0.55,
+            "areal_heat_capacity": 3.0,
+            "thermal_loss": 0.010,
+            "failure_delta_t": 160.0,
+            "hardness": 0.9,
+        },
+        "Large UAS": {
+            "speed": 80.0,
+            "angle": 15.0,
+            "aspect": 0.80,
+            "maneuver": 0.30,
+            "radius": 0.60,
+            "absorptivity": 0.50,
+            "areal_heat_capacity": 5.0,
+            "thermal_loss": 0.015,
+            "failure_delta_t": 190.0,
+            "hardness": 1.1,
+        },
+        "Rocket-like target": {
+            "speed": 300.0,
+            "angle": 5.0,
+            "aspect": 0.85,
+            "maneuver": 0.15,
+            "radius": 0.20,
+            "absorptivity": 0.45,
+            "areal_heat_capacity": 6.0,
+            "thermal_loss": 0.020,
+            "failure_delta_t": 220.0,
+            "hardness": 1.3,
+        },
+        "Generic airborne target": {
+            "speed": 120.0,
+            "angle": 45.0,
+            "aspect": 0.75,
+            "maneuver": 0.35,
+            "radius": 0.40,
+            "absorptivity": 0.50,
+            "areal_heat_capacity": 4.0,
+            "thermal_loss": 0.012,
+            "failure_delta_t": 180.0,
+            "hardness": 1.0,
+        },
+    }
+
+    target_type = st.selectbox(
+        "Target type",
+        list(TARGET_PRESETS.keys()),
+    )
+    preset = TARGET_PRESETS[target_type]
+
+    if st.session_state.get(
+        "_last_target_type_v4"
+    ) != target_type:
+        st.session_state.target_speed_v4 = preset["speed"]
+        st.session_state.target_angle_v4 = preset["angle"]
+        st.session_state.target_aspect_v4 = preset["aspect"]
+        st.session_state.target_maneuver_v4 = preset["maneuver"]
+        st.session_state.target_radius_v4 = preset["radius"]
+        st.session_state.target_absorptivity_v4 = preset["absorptivity"]
+        st.session_state.target_areal_heat_capacity_v4 = preset["areal_heat_capacity"]
+        st.session_state.target_thermal_loss_v4 = preset["thermal_loss"]
+        st.session_state.target_failure_delta_t_v4 = preset["failure_delta_t"]
+        st.session_state.target_hardness_v4 = preset["hardness"]
+        st.session_state._last_target_type_v4 = target_type
+
+    speed_mps = st.slider(
+        "Target speed (m/s)",
+        10.0,
+        350.0,
+        key="target_speed_v4",
+        step=5.0,
+    )
+    velocity_angle_deg = st.slider(
+        "Velocity angle relative to LOS (deg)",
+        0.0,
+        180.0,
+        key="target_angle_v4",
+        step=5.0,
+        help="0° = direct closing, 90° = crossing, 180° = receding.",
+    )
+    aspect_factor = st.slider(
+        "Aspect / observability factor",
+        0.2,
+        1.0,
+        key="target_aspect_v4",
+        step=0.05,
+    )
+    maneuver_factor = st.slider(
+        "Maneuver index",
+        0.0,
+        1.0,
+        key="target_maneuver_v4",
+        step=0.05,
+    )
+    characteristic_radius_m = st.slider(
+        "Characteristic aimpoint radius (m)",
+        0.05,
+        2.0,
+        key="target_radius_v4",
+        step=0.05,
+        help="Synthetic characteristic target radius used only for pointing-tolerance normalization.",
+    )
+
+    with st.expander("Target thermal properties"):
+        absorptivity = st.slider(
+            "Absorptivity",
+            0.05,
+            0.95,
+            key="target_absorptivity_v4",
+            step=0.05,
+        )
+        areal_heat_capacity_kj_m2k = st.slider(
+            "Areal heat capacity (kJ/m²-K)",
+            0.5,
+            20.0,
+            key="target_areal_heat_capacity_v4",
+            step=0.5,
+        )
+        thermal_loss_coeff_kw_m2k = st.slider(
+            "Effective thermal-loss coefficient (kW/m²-K)",
+            0.0,
+            0.10,
+            key="target_thermal_loss_v4",
+            step=0.005,
+        )
+        failure_delta_t_c = st.slider(
+            "Reference failure ΔT (°C)",
+            50.0,
+            600.0,
+            key="target_failure_delta_t_v4",
+            step=10.0,
+            help="Synthetic reference used to normalize the thermal-effect index.",
+        )
+        hardness_multiplier = st.slider(
+            "Hardness multiplier",
+            0.5,
+            3.0,
+            key="target_hardness_v4",
+            step=0.1,
+        )
+
+    st.subheader("Sensors / State Estimation")
+    radar_quality = st.slider(
+        "Radar quality",
+        0.0,
+        1.0,
+        0.90,
+        0.05,
+    )
+    eo_ir_quality = st.slider(
+        "EO/IR quality",
+        0.0,
+        1.0,
+        0.85,
+        0.05,
+    )
+    data_latency_ms = st.slider(
+        "Data latency (ms)",
+        0,
+        1500,
+        120,
+        10,
+    )
+    dropped_measurement_rate = st.slider(
+        "Dropped measurement rate",
+        0.0,
+        0.5,
+        0.03,
+        0.01,
+    )
+    track_update_hz = st.slider(
+        "Track update rate (Hz)",
+        1.0,
+        50.0,
+        10.0,
+        1.0,
+    )
+    range_measurement_sigma_m = st.slider(
+        "Range measurement 1σ (m)",
+        0.5,
+        100.0,
+        10.0,
+        0.5,
+    )
+    bearing_measurement_sigma_mrad = st.slider(
+        "Bearing measurement 1σ (mrad)",
+        0.01,
+        2.0,
+        0.20,
+        0.01,
+    )
+    process_accel_sigma_mps2 = st.slider(
+        "Process acceleration 1σ (m/s²)",
+        0.1,
+        30.0,
+        3.0,
+        0.1,
+        help="Generic process-noise term for the constant-velocity covariance model.",
+    )
+
+    st.subheader("HEL Subsystem")
+    requested_optical_source_power_kw = st.slider(
+        "Requested optical source power (kW)",
+        10.0,
+        500.0,
+        100.0,
+        10.0,
+    )
+    wall_plug_efficiency = st.slider(
+        "Wall-plug efficiency",
+        0.10,
+        0.70,
+        0.35,
+        0.05,
+    )
+    optics_efficiency = st.slider(
+        "Optical-train efficiency",
+        0.20,
+        1.00,
+        0.80,
+        0.05,
+    )
+    commanded_dwell_time_s = st.slider(
+        "Commanded dwell time (s)",
+        0.1,
+        20.0,
+        4.0,
+        0.1,
+    )
+    wavelength_um = st.slider(
+        "Optical wavelength (µm)",
+        0.5,
+        2.0,
+        1.06,
+        0.01,
+    )
+    beam_quality_m2 = st.slider(
+        "Beam quality M²",
+        1.0,
+        5.0,
+        1.3,
+        0.1,
+        help="M² = 1 is ideal Gaussian-beam quality.",
+    )
+    additional_half_angle_divergence_mrad = st.slider(
+        "Additional half-angle divergence (mrad)",
+        0.0,
+        1.0,
+        0.05,
+        0.01,
+    )
+    initial_beam_diameter_m = st.slider(
+        "Initial beam diameter (m)",
+        0.05,
+        1.00,
+        0.20,
+        0.05,
+    )
+    base_pointing_jitter_mrad = st.slider(
+        "Base pointing jitter 1σ (mrad)",
+        0.00,
+        0.50,
+        0.03,
+        0.01,
+    )
+
+    st.subheader("Platform")
+    stored_energy_kwh = st.slider(
+        "Stored energy (kWh)",
+        1.0,
+        100.0,
+        20.0,
+        1.0,
+    )
+    storage_max_discharge_kw = st.slider(
+        "Storage max discharge power (kW)",
+        0.0,
+        5000.0,
+        1000.0,
+        50.0,
+    )
+    generator_power_kw = st.slider(
+        "Generator power (kW)",
+        0.0,
+        500.0,
+        150.0,
+        10.0,
+    )
+    cooling_capacity_kw = st.slider(
+        "Cooling capacity (kW)",
+        0.0,
+        300.0,
+        70.0,
+        5.0,
+    )
+    coolant_temp_c = st.slider(
+        "Initial coolant temperature (°C)",
+        10.0,
+        80.0,
+        30.0,
+        1.0,
+    )
+    thermal_limit_c = st.slider(
+        "Thermal limit (°C)",
+        40.0,
+        120.0,
+        80.0,
+        1.0,
+    )
+    thermal_capacitance_kj_per_c = st.slider(
+        "Thermal capacitance (kJ/°C)",
+        50.0,
+        2000.0,
+        500.0,
+        50.0,
+    )
+    subsystem_health = st.slider(
+        "Subsystem health",
+        0.5,
+        1.0,
+        0.97,
+        0.01,
+    )
+
+
+env = Environment(
+    range_km,
+    humidity_pct,
+    visibility_km,
+    turbulence,
+    wind_mps,
+    ambient_temp_c,
+    angstrom_exponent,
+    humidity_absorption_km_inv_at_100pct,
+    wind_pointing_sensitivity_urad_per_mps,
+)
+
+tgt = Target(
+    target_type,
+    speed_mps,
+    velocity_angle_deg,
+    aspect_factor,
+    maneuver_factor,
+    characteristic_radius_m,
+    absorptivity,
+    areal_heat_capacity_kj_m2k,
+    thermal_loss_coeff_kw_m2k,
+    failure_delta_t_c,
+    hardness_multiplier,
+)
+
+sensors = SensorState(
+    radar_quality,
+    eo_ir_quality,
+    data_latency_ms,
+    dropped_measurement_rate,
+    track_update_hz,
+    range_measurement_sigma_m,
+    bearing_measurement_sigma_mrad,
+    process_accel_sigma_mps2,
+)
+
+hel = HELState(
+    requested_optical_source_power_kw,
+    wall_plug_efficiency,
+    optics_efficiency,
+    commanded_dwell_time_s,
+    wavelength_um,
+    beam_quality_m2,
+    additional_half_angle_divergence_mrad,
+    initial_beam_diameter_m,
+    base_pointing_jitter_mrad,
+)
+
+platform = PlatformState(
+    stored_energy_kwh,
+    storage_max_discharge_kw,
+    generator_power_kw,
+    cooling_capacity_kw,
+    coolant_temp_c,
+    thermal_limit_c,
+    thermal_capacitance_kj_per_c,
+    subsystem_health,
+)
+
+timeline, result = simulate_time_stepped_engagement(
+    env,
+    tgt,
+    sensors,
+    hel,
+    platform,
+    dt_s=0.10,
+)
+
+
+# ============================================================
+# Engagement state
+# ============================================================
+
+st.subheader("Engagement State")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric(
+    "Track Quality",
+    f"{result['Track Quality'] * 100:.1f}%",
+)
+m2.metric(
+    "Track Angular 1σ",
+    f"{result['Track Angular 1σ (mrad)']:.3f} mrad",
+)
+m3.metric(
+    "Atmospheric Transmission",
+    f"{result['Atmospheric Transmission'] * 100:.1f}%",
+)
+m4.metric(
+    "Aimpoint Margin Index",
+    f"{result['Aimpoint Margin Index'] * 100:.1f}%",
+)
+
+m5, m6, m7, m8 = st.columns(4)
+m5.metric(
+    "Average Target Irradiance",
+    f"{result['Average Irradiance (kW/m^2)']:.1f} kW/m²",
+)
+m6.metric(
+    "Target Surface ΔT",
+    f"{result['Target ΔT (C)']:.1f} °C",
+)
+m7.metric(
+    "Thermal Effect Index",
+    f"{result['Estimated Thermal Effect Index'] * 100:.1f}%",
+)
+m8.metric(
+    "Readiness Score",
+    f"{result['Readiness Score'] * 100:.1f}%",
+)
+
+if "ENGAGE" in result["Recommendation"]:
+    st.success(result["Recommendation"])
+elif "CAUTION" in result["Recommendation"]:
+    st.warning(result["Recommendation"])
+else:
+    st.error(result["Recommendation"])
+
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "Engagement Loop",
+        "State Estimation",
+        "Time History",
+        "Monte Carlo",
+        "Model State",
+    ]
+)
+
+
+# ============================================================
+# Engagement loop
+# ============================================================
+
+with tab1:
+    st.markdown("### End-to-End Engagement Architecture")
+
+    stages = [
+        (
+            "1. Detect",
+            result["Detection Probability"],
+        ),
+        (
+            "2. Identify",
+            result["Classification Confidence"],
+        ),
+        (
+            "3. Track",
+            result["Track Quality"],
+        ),
+        (
+            "4. Decide",
+            result["Readiness Score"],
+        ),
+        (
+            "5. Point / Aim",
+            result["Aimpoint Margin Index"],
+        ),
+        (
+            "6. Deliver Energy",
+            result["Power Availability Ratio"]
+            * result["Atmospheric Transmission"],
+        ),
+        (
+            "7. Assess Effect",
+            result["Estimated Thermal Effect Index"],
+        ),
+        (
+            "8. Re-engage",
+            result["Readiness Score"],
+        ),
+    ]
+
+    stage_df = pd.DataFrame(
+        stages,
+        columns=[
+            "Stage",
+            "State / Confidence",
+        ],
+    )
+
+    st.dataframe(
+        stage_df.style.format({
+            "State / Confidence": "{:.1%}"
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("### Decision-Support State")
+
+    state_table = pd.DataFrame({
+        "Parameter": [
+            "Detection probability",
+            "Classification confidence",
+            "Track quality",
+            "Track cross-range 1σ",
+            "Track angular 1σ",
+            "LOS rate",
+            "Aimpoint confidence",
+            "Atmospheric transmission",
+            "Optical depth",
+            "Available engagement time",
+            "Time to CPA",
+            "CPA range",
+            "Effective dwell time",
+            "Requested electrical input",
+            "Actual electrical input",
+            "Power availability ratio",
+            "Generator contribution",
+            "Storage draw",
+            "Target optical power",
+            "Spot diameter",
+            "Average target irradiance",
+            "Absorbed heat flux",
+            "Target surface ΔT",
+            "Target surface temperature",
+            "Estimated thermal effect index",
+            "Coolant temperature after dwell",
+            "Thermal margin",
+            "Energy margin",
+            "Recommendation",
+        ],
+        "Value": [
+            f"{result['Detection Probability']:.1%}",
+            f"{result['Classification Confidence']:.1%}",
+            f"{result['Track Quality']:.1%}",
+            f"{result['Track Cross-Range 1σ (m)']:.2f} m",
+            f"{result['Track Angular 1σ (mrad)']:.3f} mrad",
+            f"{result['LOS Rate (mrad/s)']:.3f} mrad/s",
+            f"{result['Aimpoint Margin Index']:.1%}",
+            f"{result['Atmospheric Transmission']:.1%}",
+            f"{result['Optical Depth']:.3f}",
+            f"{result['Available Engagement Time (s)']:.2f} s",
+            f"{result['Time to CPA (s)']:.2f} s",
+            f"{result['CPA Range (m)']:.1f} m",
+            f"{result['Effective Dwell Time (s)']:.2f} s",
+            f"{result['Requested Electrical Input (kW)']:.1f} kW",
+            f"{result['Actual Electrical Input (kW)']:.1f} kW",
+            f"{result['Power Availability Ratio']:.1%}",
+            f"{result['Generator Contribution (kW)']:.1f} kW",
+            f"{result['Storage Draw (kW)']:.1f} kW",
+            f"{result['Target Optical Power (kW)']:.1f} kW",
+            f"{result['Spot Diameter (m)']:.2f} m",
+            f"{result['Average Irradiance (kW/m^2)']:.1f} kW/m²",
+            f"{result['Absorbed Heat Flux (kW/m^2)']:.1f} kW/m²",
+            f"{result['Target ΔT (C)']:.1f} °C",
+            f"{result['Target Surface Temp (C)']:.1f} °C",
+            f"{result['Estimated Thermal Effect Index']:.1%}",
+            f"{result['Coolant Temp After Dwell (C)']:.1f} °C",
+            f"{result['Thermal Margin']:.1%}",
+            f"{result['Energy Margin']:.1%}",
+            result["Recommendation"],
+        ],
+    })
+
+    st.dataframe(
+        state_table,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# State estimation
+# ============================================================
+
+with tab2:
+    st.markdown("### Covariance-Based State Estimation")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "Radial Position 1σ",
+        f"{result['Track Radial 1σ (m)']:.2f} m",
+    )
+    c2.metric(
+        "Cross-Range 1σ",
+        f"{result['Track Cross-Range 1σ (m)']:.2f} m",
+    )
+    c3.metric(
+        "Angular Track 1σ",
+        f"{result['Track Angular 1σ (mrad)']:.3f} mrad",
+    )
+    c4.metric(
+        "Target Angular Radius",
+        f"{result['Target Angular Radius (mrad)']:.3f} mrad",
+    )
+
+    st.caption(
+        "The tracker is a sequential constant-velocity Kalman covariance model. "
+        "Covariance is carried continuously through the engagement and propagated "
+        "through processing latency. It does not represent a particular operational "
+        "radar, EO/IR tracker, or fire-control system."
+    )
+
+    uncertainty_df = pd.DataFrame({
+        "Quantity": [
+            "Range measurement 1σ",
+            "Bearing measurement 1σ",
+            "Process acceleration 1σ",
+            "Track update rate",
+            "Data latency",
+            "LOS angular rate",
+            "Combined pointing 1σ",
+        ],
+        "Value": [
+            f"{sensors.range_measurement_sigma_m:.2f} m",
+            f"{sensors.bearing_measurement_sigma_mrad:.3f} mrad",
+            f"{sensors.process_accel_sigma_mps2:.2f} m/s²",
+            f"{sensors.track_update_hz:.1f} Hz",
+            f"{sensors.data_latency_ms:.0f} ms",
+            f"{result['LOS Rate (mrad/s)']:.3f} mrad/s",
+            f"{result['Combined Pointing 1σ (mrad)']:.3f} mrad",
+        ],
+    })
+
+    st.dataframe(
+        uncertainty_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+# ============================================================
+# Time histories
+# ============================================================
+
+with tab3:
+    # Reuse the authoritative engagement timeline generated for the dashboard.
+    fig1, ax1 = plt.subplots(figsize=(9, 4))
+    ax1.plot(
+        timeline["Time (s)"],
+        timeline["Estimated Thermal Effect Index"],
+        color=HUD_GREEN,
+        linewidth=2.2,
+    )
+    ax1.set_xlabel("Dwell Time (s)")
+    ax1.set_ylabel("Estimated Thermal Effect Index")
+    ax1.set_ylim(0, 1)
+    ax1.grid(True, alpha=0.3)
+    st.pyplot(fig1)
+    plt.close(fig1)
+
+
+    fig_range, ax_range = plt.subplots(figsize=(9, 4))
+    ax_range.plot(
+        timeline["Time (s)"],
+        timeline["Range (km)"],
+        color=HUD_ORANGE,
+        linewidth=2.2,
+    )
+    ax_range.set_xlabel("Engagement Time (s)")
+    ax_range.set_ylabel("Target Range (km)")
+    ax_range.grid(True, alpha=0.3)
+    st.pyplot(fig_range)
+    plt.close(fig_range)
+
+    fig2, ax2 = plt.subplots(figsize=(9, 4))
+    ax2.plot(
+        timeline["Time (s)"],
+        timeline["Target Surface Temp (C)"],
+        color=HUD_ORANGE,
+        linewidth=2.2,
+        label="Target surface",
+    )
+    ax2.plot(
+        timeline["Time (s)"],
+        timeline["Coolant Temp (C)"],
+        color=HUD_GREEN,
+        linewidth=1.8,
+        label="Platform coolant",
+    )
+    ax2.axhline(
+        env.ambient_temp_c,
+        linestyle=":",
+        color=HUD_MUTED,
+        linewidth=1.2,
+        label="Ambient",
+    )
+    ax2.set_xlabel("Dwell Time (s)")
+    ax2.set_ylabel("Temperature (°C)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+    st.pyplot(fig2)
+    plt.close(fig2)
+
+    fig3, ax3 = plt.subplots(figsize=(9, 4))
+    ax3.plot(
+        timeline["Time (s)"],
+        timeline["Stored Energy Remaining (kWh)"],
+        color=HUD_GREEN,
+        linewidth=2.2,
+    )
+    ax3.set_xlabel("Dwell Time (s)")
+    ax3.set_ylabel("Stored Energy Remaining (kWh)")
+    ax3.grid(True, alpha=0.3)
+    st.pyplot(fig3)
+    plt.close(fig3)
+
+
+# ============================================================
+# Monte Carlo
+# ============================================================
+
+with tab4:
+    st.markdown("### Monte Carlo Uncertainty Analysis")
+
+    runs = st.slider(
+        "Simulation runs",
+        100,
+        3000,
+        1000,
+        100,
+    )
+
+    if st.button("Run Monte Carlo"):
+        records = [
+            simulate_dynamic_monte_carlo_run(
+                env,
+                tgt,
+                sensors,
+                hel,
+                platform,
+            )
+            for _ in range(runs)
+        ]
+
+        mc = pd.DataFrame(records)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Mean Thermal Effect Index",
+            f"{mc['Estimated Thermal Effect Index'].mean():.1%}",
+        )
+        c2.metric(
+            "P(Index > 70%)",
+            f"{(mc['Estimated Thermal Effect Index'] > 0.70).mean():.1%}",
+        )
+        c3.metric(
+            "Mean Track Angular 1σ",
+            f"{mc['Track Angular 1σ (mrad)'].mean():.3f} mrad",
+        )
+        c4.metric(
+            "Thermal Constraint Rate",
+            f"{(mc['Thermal Margin'] < 0.12).mean():.1%}",
+        )
+
+        fig4, ax4 = plt.subplots(figsize=(9, 4))
+        ax4.hist(
+            mc["Estimated Thermal Effect Index"],
+            bins=30,
+            color=HUD_GREEN_DIM,
+            edgecolor=HUD_GREEN_BRIGHT,
+        )
+        ax4.set_xlabel("Estimated Thermal Effect Index")
+        ax4.set_ylabel("Frequency")
+        ax4.grid(True, alpha=0.3)
+        st.pyplot(fig4)
+        plt.close(fig4)
+
+        summary = mc[[
+            "Detection Probability",
+            "Track Quality",
+            "Track Angular 1σ (mrad)",
+            "Aimpoint Margin Index",
+            "Atmospheric Transmission",
+            "Effective Dwell Time (s)",
+            "Target Optical Power (kW)",
+            "Spot Diameter (m)",
+            "Average Irradiance (kW/m^2)",
+            "Target ΔT (C)",
+            "Estimated Thermal Effect Index",
+            "Thermal Margin",
+            "Energy Margin",
+            "Readiness Score",
+        ]].describe().T
+
+        st.dataframe(
+            summary,
+            use_container_width=True,
+        )
+
+        csv = mc.to_csv(
+            index=False
+        ).encode("utf-8")
+
+        st.download_button(
+            "Download Monte Carlo CSV",
+            csv,
+            file_name="directed_energy_monte_carlo.csv",
+            mime="text/csv",
+        )
+
+
+# ============================================================
+# Model state
+# ============================================================
+
+with tab5:
+    st.markdown("### Digital Twin State Vector")
+
+    st.json({
+        "Environment": asdict(env),
+        "Target": asdict(tgt),
+        "Sensor State": asdict(sensors),
+        "HEL State": asdict(hel),
+        "Platform State": asdict(platform),
+        "Engagement Output": result,
+    })
+
+
+st.divider()
+
+st.caption(
+    "Engineering note: This application is a physics-informed, low-order digital "
+    "engineering framework. Atmospheric extinction uses a Beer-Lambert model with "
+    "visibility-derived aerosol extinction, Rayleigh scaling, and a generic humidity "
+    "term. Tracking uses sequential constant-velocity Kalman covariance propagation, "
+    "and instantaneous LOS rate is computed directly from the evolving 2-D geometry. "
+    "Target response uses a lumped areal thermal model. None of these models constitute validated "
+    "operational weapon-performance, lethality, or probability-of-kill predictions. "
+    "The current target-speed envelope remains intentionally limited to 350 m/s."
+)
