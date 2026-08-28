@@ -7145,6 +7145,64 @@ with tab8:
         adv_platform,
     )
 
+    valid_recon = adv_reconstruction.dropna()
+
+    # UI-only auto-fit for the Advanced Twin 3-D visualization.
+    # The underlying truth, platform, and measurement states are unchanged.
+    advanced_plot_x = np.concatenate(
+        [
+            adv_truth["X (m)"].to_numpy(dtype=float),
+            adv_platform["X (m)"].to_numpy(dtype=float),
+            valid_recon["Estimated X (m)"].to_numpy(dtype=float)
+            if not valid_recon.empty
+            else np.array([], dtype=float),
+        ]
+    )
+    advanced_plot_y = np.concatenate(
+        [
+            adv_truth["Y (m)"].to_numpy(dtype=float),
+            adv_platform["Y (m)"].to_numpy(dtype=float),
+            valid_recon["Estimated Y (m)"].to_numpy(dtype=float)
+            if not valid_recon.empty
+            else np.array([], dtype=float),
+        ]
+    )
+    advanced_plot_z = np.concatenate(
+        [
+            adv_truth["Z (m)"].to_numpy(dtype=float),
+            adv_platform["Z (m)"].to_numpy(dtype=float),
+            valid_recon["Estimated Z (m)"].to_numpy(dtype=float)
+            if not valid_recon.empty
+            else np.array([], dtype=float),
+        ]
+    )
+
+    def _advanced_axis_range(values_m, min_span_m, pad_fraction=0.12):
+        finite = values_m[np.isfinite(values_m)]
+        if finite.size == 0:
+            finite = np.array([0.0], dtype=float)
+        vmin = float(np.min(finite))
+        vmax = float(np.max(finite))
+        span = max(vmax - vmin, float(min_span_m))
+        pad = max(span * float(pad_fraction), 25.0)
+        center = 0.5 * (vmin + vmax)
+        half = 0.5 * span + pad
+        return [(center - half) / 1000.0, (center + half) / 1000.0]
+
+    adv_x_range = _advanced_axis_range(advanced_plot_x, min_span_m=1000.0)
+    adv_y_range = _advanced_axis_range(advanced_plot_y, min_span_m=600.0)
+    adv_z_range = _advanced_axis_range(advanced_plot_z, min_span_m=500.0, pad_fraction=0.15)
+
+    adv_x_span = max(adv_x_range[1] - adv_x_range[0], 1e-6)
+    adv_y_span = max(adv_y_range[1] - adv_y_range[0], 1e-6)
+    adv_z_span = max(adv_z_range[1] - adv_z_range[0], 1e-6)
+    adv_max_span = max(adv_x_span, adv_y_span, adv_z_span)
+    adv_aspect_ratio = dict(
+        x=max(adv_x_span / adv_max_span, 0.34),
+        y=max(adv_y_span / adv_max_span, 0.34),
+        z=max(adv_z_span / adv_max_span, 0.28),
+    )
+
     truth_plot = go.Figure()
     truth_plot.add_trace(
         go.Scatter3d(
@@ -7164,7 +7222,6 @@ with tab8:
             name="Moving Platform",
         )
     )
-    valid_recon = adv_reconstruction.dropna()
     if not valid_recon.empty:
         truth_plot.add_trace(
             go.Scatter3d(
@@ -7179,15 +7236,36 @@ with tab8:
 
     truth_plot.update_layout(
         height=620,
-        margin=dict(l=0, r=0, t=35, b=0),
+        margin=dict(l=0, r=0, t=58, b=0),
         scene=dict(
-            xaxis_title="X (km)",
-            yaxis_title="Y (km)",
-            zaxis_title="Z (km)",
-            aspectmode="data",
+            xaxis=dict(title="X (km)", range=adv_x_range),
+            yaxis=dict(title="Y (km)", range=adv_y_range),
+            zaxis=dict(title="Z (km)", range=adv_z_range),
+            aspectmode="manual",
+            aspectratio=adv_aspect_ratio,
+            camera=dict(
+                eye=dict(x=1.10, y=1.10, z=0.80),
+                center=dict(x=0.0, y=0.0, z=-0.03),
+            ),
         ),
-        title="3D Maneuvering Truth / Moving Platform / Sensor Measurements",
+        title=dict(
+            text="3D Maneuvering Truth / Moving Platform / Sensor Measurements",
+            x=0.02,
+            xanchor="left",
+            font=dict(size=18),
+        ),
+        legend=dict(
+            orientation="h",
+            x=0.02,
+            y=0.98,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(0,0,0,0.35)",
+            font=dict(size=10),
+            itemsizing="constant",
+        ),
         showlegend=True,
+        uirevision="advanced-twin-3d-view",
     )
     st.plotly_chart(
         truth_plot,
