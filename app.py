@@ -27,6 +27,7 @@ HUD_ORANGE_DIM = "#A84300"
 HUD_TEXT = "#E9FFE1"
 HUD_MUTED = "#9DBA96"
 HUD_RED = "#FF4D3D"
+CURRENT_TARGET_BLUE = "#2F6BFF"
 HUD_BG = "#020402"
 HUD_GRID = "#214A19"
 
@@ -176,6 +177,8 @@ class Target:
     target_type: str
     speed_mps: float
     velocity_angle_deg: float
+    initial_altitude_m: float
+    flight_path_angle_deg: float
     aspect_factor: float
     maneuver_factor: float
     characteristic_radius_m: float
@@ -233,41 +236,166 @@ def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
-def target_velocity_components_mps(tgt: Target):
+def target_initial_position_m(
+    env: Environment,
+    tgt: Target,
+) -> np.ndarray:
     """
-    2-D relative kinematics:
-      0 deg   = direct closing
-      90 deg  = crossing
-      180 deg = receding
+    Initial 3-D target position relative to the directed-energy platform.
+
+    env.range_km is interpreted as initial horizontal ground range.
+    tgt.initial_altitude_m is the physical modeled altitude above the platform plane.
     """
-    angle = math.radians(tgt.velocity_angle_deg)
-    radial_closing_mps = tgt.speed_mps * math.cos(angle)
-    transverse_mps = tgt.speed_mps * math.sin(angle)
-    return radial_closing_mps, transverse_mps
+    return np.array(
+        [
+            env.range_km * 1000.0,
+            0.0,
+            tgt.initial_altitude_m,
+        ],
+        dtype=float,
+    )
+
+
+def target_velocity_vector_mps(
+    tgt: Target,
+) -> np.ndarray:
+    """
+    True 3-D constant-velocity target vector.
+
+    velocity_angle_deg:
+      0 deg   = horizontal component directly closing
+      90 deg  = horizontal crossing
+      180 deg = horizontal component receding
+
+    flight_path_angle_deg:
+      positive = climbing
+      zero     = level
+      negative = descending
+    """
+    horizontal_angle = math.radians(
+        tgt.velocity_angle_deg
+    )
+    gamma = math.radians(
+        tgt.flight_path_angle_deg
+    )
+
+    horizontal_speed = (
+        tgt.speed_mps * math.cos(gamma)
+    )
+
+    vx = (
+        -horizontal_speed
+        * math.cos(horizontal_angle)
+    )
+    vy = (
+        horizontal_speed
+        * math.sin(horizontal_angle)
+    )
+    vz = (
+        tgt.speed_mps
+        * math.sin(gamma)
+    )
+
+    return np.array(
+        [vx, vy, vz],
+        dtype=float,
+    )
+
+
+def target_velocity_components_mps(
+    tgt: Target,
+):
+    """
+    Backward-compatible horizontal decomposition used only by legacy diagnostics.
+    """
+    v = target_velocity_vector_mps(tgt)
+    return -float(v[0]), float(v[1])
+
+
+def instantaneous_los_axis_rates_mrad_s(
+    position_m: np.ndarray,
+    velocity_mps: np.ndarray,
+):
+    """
+    Exact azimuth and elevation LOS rates for 3-D Cartesian relative motion.
+    """
+    x, y, z = (
+        float(position_m[0]),
+        float(position_m[1]),
+        float(position_m[2]),
+    )
+    vx, vy, vz = (
+        float(velocity_mps[0]),
+        float(velocity_mps[1]),
+        float(velocity_mps[2]),
+    )
+
+    rho2 = max(
+        x * x + y * y,
+        1e-12,
+    )
+    rho = math.sqrt(rho2)
+    r2 = max(
+        rho2 + z * z,
+        1.0,
+    )
+
+    az_rate_rad_s = (
+        x * vy - y * vx
+    ) / rho2
+
+    rho_dot = (
+        x * vx + y * vy
+    ) / max(rho, 1e-9)
+
+    el_rate_rad_s = (
+        rho * vz
+        - z * rho_dot
+    ) / r2
+
+    elevation_rad = math.atan2(
+        z,
+        rho,
+    )
+
+    # Physical LOS angular speed on the unit sphere.
+    los_rate_rad_s = math.sqrt(
+        (
+            az_rate_rad_s
+            * math.cos(elevation_rad)
+        ) ** 2
+        + el_rate_rad_s**2
+    )
+
+    return {
+        "azimuth_rate_mrad_s": az_rate_rad_s * 1000.0,
+        "elevation_rate_mrad_s": el_rate_rad_s * 1000.0,
+        "magnitude_mrad_s": los_rate_rad_s * 1000.0,
+        "azimuth_rad": math.atan2(y, x),
+        "elevation_rad": elevation_rad,
+    }
 
 
 def instantaneous_los_rate_mrad_s(
     position_m: np.ndarray,
     velocity_mps: np.ndarray,
 ) -> float:
-    """
-    Exact 2-D instantaneous LOS angular rate:
-
-        lambda_dot = (x * vy - y * vx) / (x^2 + y^2)
-
-    Returned as an absolute magnitude in mrad/s.
-    """
-    x, y = float(position_m[0]), float(position_m[1])
-    vx, vy = float(velocity_mps[0]), float(velocity_mps[1])
-    r2 = max(x * x + y * y, 1.0)
-    return abs((x * vy - y * vx) / r2) * 1000.0
+    return abs(
+        instantaneous_los_axis_rates_mrad_s(
+            position_m,
+            velocity_mps,
+        )["magnitude_mrad_s"]
+    )
 
 
-def line_of_sight_rate_mrad_s(env: Environment, tgt: Target) -> float:
-    radial_closing, transverse = target_velocity_components_mps(tgt)
-    position_m = np.array([env.range_km * 1000.0, 0.0], dtype=float)
-    velocity_mps = np.array([-radial_closing, transverse], dtype=float)
-    return instantaneous_los_rate_mrad_s(position_m, velocity_mps)
+def line_of_sight_rate_mrad_s(
+    env: Environment,
+    tgt: Target,
+) -> float:
+    return instantaneous_los_rate_mrad_s(
+        target_initial_position_m(env, tgt),
+        target_velocity_vector_mps(tgt),
+    )
 
 
 def engagement_geometry(
@@ -277,72 +405,143 @@ def engagement_geometry(
     minimum_range_m: float = 100.0,
 ):
     """
-    Constant-velocity 2-D engagement geometry.
+    Constant-velocity 3-D engagement geometry.
 
-    The engagement horizon is terminated at the earliest physically relevant event:
-      1) commanded path reaches the minimum modeled range,
-      2) closest point of approach (CPA) for a closing/crossing trajectory,
-      3) exit from the circular model zone for a receding trajectory.
-
-    This prevents the model from "continuing through" the defended point and counting
-    post-CPA time as useful engagement time.
+    CPA, minimum range, model-zone exit, and engagement horizon are all computed
+    from the true 3-D relative position and velocity vectors.
     """
-    r0 = np.array([env.range_km * 1000.0, 0.0], dtype=float)
-    radial_closing, transverse = target_velocity_components_mps(tgt)
-    v = np.array([-radial_closing, transverse], dtype=float)
+    r0 = target_initial_position_m(
+        env,
+        tgt,
+    )
+    v = target_velocity_vector_mps(
+        tgt
+    )
 
     speed2 = float(v @ v)
-    r0_mag = float(np.linalg.norm(r0))
-    rmax = max(model_zone_range_km * 1000.0, r0_mag)
-    rmin = max(minimum_range_m, 1.0)
+    r0_mag = float(
+        np.linalg.norm(r0)
+    )
+    rmax = max(
+        model_zone_range_km * 1000.0,
+        r0_mag,
+    )
+    rmin = max(
+        minimum_range_m,
+        1.0,
+    )
 
     if speed2 <= 1e-12:
         return {
             "time_to_cpa_s": float("inf"),
             "cpa_range_m": r0_mag,
+            "cpa_position_m": r0.copy(),
             "time_to_min_range_s": float("inf"),
             "time_to_zone_exit_s": float("inf"),
+            "time_to_ground_impact_s": float("inf"),
             "engagement_horizon_s": float("inf"),
         }
 
-    t_cpa = max(0.0, -float(r0 @ v) / speed2)
-    r_cpa = r0 + v * t_cpa
-    cpa_range_m = float(np.linalg.norm(r_cpa))
+    t_cpa_raw = (
+        -float(r0 @ v)
+        / speed2
+    )
+    t_cpa = max(
+        0.0,
+        t_cpa_raw,
+    )
+    r_cpa = (
+        r0 + v * t_cpa
+    )
+    cpa_range_m = float(
+        np.linalg.norm(r_cpa)
+    )
 
-    def circle_intersection_time(radius_m):
+    def sphere_intersection_times(radius_m):
         a = speed2
         b = 2.0 * float(r0 @ v)
         c = float(r0 @ r0) - radius_m**2
-        disc = b * b - 4.0 * a * c
+
+        disc = (
+            b * b - 4.0 * a * c
+        )
         if disc < 0.0:
-            return float("inf")
+            return []
+
         root = math.sqrt(disc)
         roots = [
             (-b - root) / (2.0 * a),
             (-b + root) / (2.0 * a),
         ]
-        positive = [t for t in roots if t >= 0.0]
-        return min(positive) if positive else float("inf")
+        return sorted(
+            t for t in roots
+            if t >= 0.0
+        )
 
-    time_to_min_range_s = circle_intersection_time(rmin)
-    time_to_zone_exit_s = circle_intersection_time(rmax)
+    min_roots = sphere_intersection_times(
+        rmin
+    )
+    zone_roots = sphere_intersection_times(
+        rmax
+    )
 
-    radial_closing_now, _ = target_velocity_components_mps(tgt)
+    time_to_min_range_s = (
+        min_roots[0]
+        if min_roots
+        else float("inf")
+    )
 
-    if radial_closing_now > 0.0:
-        if math.isfinite(time_to_min_range_s):
-            engagement_horizon_s = min(t_cpa, time_to_min_range_s)
-        else:
-            engagement_horizon_s = t_cpa
+    time_to_zone_exit_s = (
+        zone_roots[-1]
+        if zone_roots
+        else float("inf")
+    )
+
+    if float(v[2]) < -1e-12:
+        time_to_ground_impact_s = max(
+            0.0,
+            -float(r0[2]) / float(v[2]),
+        )
     else:
-        engagement_horizon_s = time_to_zone_exit_s
+        time_to_ground_impact_s = float("inf")
+
+    initially_closing = (
+        float(r0 @ v) < 0.0
+    )
+
+    if initially_closing:
+        engagement_horizon_s = t_cpa
+        if math.isfinite(
+            time_to_min_range_s
+        ):
+            engagement_horizon_s = min(
+                engagement_horizon_s,
+                time_to_min_range_s,
+            )
+    else:
+        engagement_horizon_s = (
+            time_to_zone_exit_s
+        )
+
+    if math.isfinite(
+        time_to_ground_impact_s
+    ):
+        engagement_horizon_s = min(
+            engagement_horizon_s,
+            time_to_ground_impact_s,
+        )
 
     return {
         "time_to_cpa_s": t_cpa,
         "cpa_range_m": cpa_range_m,
+        "cpa_position_m": r_cpa,
         "time_to_min_range_s": time_to_min_range_s,
         "time_to_zone_exit_s": time_to_zone_exit_s,
-        "engagement_horizon_s": max(0.0, engagement_horizon_s),
+        "time_to_ground_impact_s": time_to_ground_impact_s,
+        "engagement_horizon_s": max(
+            0.0,
+            engagement_horizon_s,
+        ),
     }
 
 
@@ -350,7 +549,10 @@ def available_engagement_time_s(
     env: Environment,
     tgt: Target,
 ) -> float:
-    return engagement_geometry(env, tgt)["engagement_horizon_s"]
+    return engagement_geometry(
+        env,
+        tgt,
+    )["engagement_horizon_s"]
 
 
 def effective_dwell_time_s(
@@ -360,7 +562,10 @@ def effective_dwell_time_s(
 ) -> float:
     return min(
         hel.commanded_dwell_time_s,
-        available_engagement_time_s(env, tgt),
+        available_engagement_time_s(
+            env,
+            tgt,
+        ),
     )
 
 
@@ -469,12 +674,17 @@ def classification_confidence(
     )
 
 
-def cv_transition(dt: float):
-    return np.array([
-        [1.0, 0.0, dt, 0.0],
-        [0.0, 1.0, 0.0, dt],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
+def cv_transition(
+    dt: float,
+):
+    """
+    6-state constant-velocity transition for [x, y, z, vx, vy, vz].
+    """
+    I3 = np.eye(3)
+    Z3 = np.zeros((3, 3))
+    return np.block([
+        [I3, dt * I3],
+        [Z3, I3],
     ])
 
 
@@ -482,12 +692,25 @@ def cv_process_noise(
     dt: float,
     accel_sigma_mps2: float,
 ):
-    q = max(accel_sigma_mps2, 1e-6) ** 2
-    return q * np.array([
-        [dt**4 / 4.0, 0.0, dt**3 / 2.0, 0.0],
-        [0.0, dt**4 / 4.0, 0.0, dt**3 / 2.0],
-        [dt**3 / 2.0, 0.0, dt**2, 0.0],
-        [0.0, dt**3 / 2.0, 0.0, dt**2],
+    """
+    Isotropic 3-D piecewise-constant acceleration process-noise covariance.
+    """
+    q = max(
+        accel_sigma_mps2,
+        1e-6,
+    ) ** 2
+
+    I3 = np.eye(3)
+
+    return q * np.block([
+        [
+            (dt**4 / 4.0) * I3,
+            (dt**3 / 2.0) * I3,
+        ],
+        [
+            (dt**3 / 2.0) * I3,
+            (dt**2) * I3,
+        ],
     ])
 
 
@@ -495,21 +718,65 @@ def los_basis_from_position(
     position_m: np.ndarray,
 ):
     """
-    Return instantaneous radial and transverse unit vectors in the 2-D engagement plane.
+    Return a right-handed 3-D LOS basis:
+      u_r  = radial/slant-range direction
+      u_az = local azimuth transverse direction
+      u_el = local elevation transverse direction
     """
-    p = np.asarray(position_m, dtype=float)
+    p = np.asarray(
+        position_m,
+        dtype=float,
+    )[:3]
+
     range_m = max(
-        float(np.linalg.norm(p[:2])),
+        float(np.linalg.norm(p)),
         1.0,
     )
+    u_r = p / range_m
 
-    u_r = p[:2] / range_m
-    u_t = np.array(
-        [-u_r[1], u_r[0]],
+    reference_up = np.array(
+        [0.0, 0.0, 1.0],
         dtype=float,
     )
 
-    return u_r, u_t, range_m
+    u_az = np.cross(
+        reference_up,
+        u_r,
+    )
+
+    if (
+        float(np.linalg.norm(u_az))
+        < 1e-8
+    ):
+        reference_up = np.array(
+            [0.0, 1.0, 0.0],
+            dtype=float,
+        )
+        u_az = np.cross(
+            reference_up,
+            u_r,
+        )
+
+    u_az = u_az / max(
+        float(np.linalg.norm(u_az)),
+        1e-12,
+    )
+
+    u_el = np.cross(
+        u_r,
+        u_az,
+    )
+    u_el = u_el / max(
+        float(np.linalg.norm(u_el)),
+        1e-12,
+    )
+
+    return (
+        u_r,
+        u_az,
+        u_el,
+        range_m,
+    )
 
 
 def track_measurement_covariance(
@@ -520,19 +787,29 @@ def track_measurement_covariance(
     apply_availability_weighting: bool = True,
 ):
     """
-    Build the Cartesian measurement covariance from range/bearing uncertainty.
+    Approximate 3-D Cartesian measurement covariance derived from:
+      * range uncertainty,
+      * azimuth angular uncertainty,
+      * elevation angular uncertainty.
 
-    The native measurement covariance is defined in the instantaneous LOS frame and
-    rotated into the fixed Cartesian estimator frame. Detection probability and the
-    configured dropped-measurement rate reduce effective measurement information.
+    The same generic bearing sigma is used for both angular axes.
     """
     if position_m is None:
         position_m = np.array(
-            [env.range_km * 1000.0, 0.0],
+            [
+                env.range_km * 1000.0,
+                0.0,
+                0.0,
+            ],
             dtype=float,
         )
 
-    u_r, u_t, range_m = los_basis_from_position(
+    (
+        u_r,
+        u_az,
+        u_el,
+        range_m,
+    ) = los_basis_from_position(
         position_m
     )
 
@@ -554,8 +831,28 @@ def track_measurement_covariance(
         / combined_quality
     )
 
-    sigma_cross = max(
-        range_m * sigma_bearing_rad,
+    horizontal_range_m = max(
+        math.hypot(
+            float(position_m[0]),
+            float(position_m[1]),
+        ),
+        1e-6,
+    )
+    cos_elevation = clamp(
+        horizontal_range_m / range_m,
+        1e-6,
+        1.0,
+    )
+
+    sigma_az_cross = max(
+        range_m
+        * cos_elevation
+        * sigma_bearing_rad,
+        0.1,
+    )
+    sigma_el_cross = max(
+        range_m
+        * sigma_bearing_rad,
         0.1,
     )
 
@@ -576,21 +873,23 @@ def track_measurement_covariance(
             1.0,
         )
     else:
-        # In stochastic mode, receipt/miss has already been sampled. Conditional
-        # on receipt, use nominal measurement covariance to avoid double-counting.
         information_availability = 1.0
 
     R_los = np.diag([
         sigma_range**2
         / information_availability,
-        sigma_cross**2
+        sigma_az_cross**2
+        / information_availability,
+        sigma_el_cross**2
         / information_availability,
     ])
 
-    # Columns of B are the instantaneous LOS-frame basis vectors expressed in
-    # fixed Cartesian coordinates.
     B = np.column_stack(
-        [u_r, u_t]
+        [
+            u_r,
+            u_az,
+            u_el,
+        ]
     )
 
     R_cartesian = (
@@ -600,7 +899,8 @@ def track_measurement_covariance(
     return (
         R_cartesian,
         sigma_range,
-        sigma_cross,
+        sigma_az_cross,
+        sigma_el_cross,
         raw_measurement_availability,
     )
 
@@ -611,22 +911,54 @@ def initialize_track_covariance(
     sensors: SensorState,
 ):
     """
-    Initialize a conservative fixed-Cartesian covariance:
-    [x, y, vx, vy].
-
-    At initialization, the LOS is aligned with +x, so the LOS-frame range/cross-range
-    uncertainties map directly into the Cartesian axes.
+    Initialize a conservative fixed-Cartesian 6x6 covariance:
+    [x, y, z, vx, vy, vz].
     """
-    initial_position_m = np.array(
-        [env.range_km * 1000.0, 0.0],
-        dtype=float,
+    initial_position_m = (
+        target_initial_position_m(
+            env,
+            tgt,
+        )
     )
 
-    _, sigma_range, sigma_cross, _ = track_measurement_covariance(
+    (
+        _,
+        sigma_range,
+        sigma_az_cross,
+        sigma_el_cross,
+        _,
+    ) = track_measurement_covariance(
         env,
         sensors,
         initial_position_m,
         detection_probability_value=1.0,
+    )
+
+    (
+        u_r,
+        u_az,
+        u_el,
+        _,
+    ) = los_basis_from_position(
+        initial_position_m
+    )
+
+    B = np.column_stack(
+        [
+            u_r,
+            u_az,
+            u_el,
+        ]
+    )
+
+    P_pos_los = np.diag([
+        (2.0 * sigma_range) ** 2,
+        (2.0 * sigma_az_cross) ** 2,
+        (2.0 * sigma_el_cross) ** 2,
+    ])
+
+    P_pos = (
+        B @ P_pos_los @ B.T
     )
 
     velocity_sigma_init = max(
@@ -634,11 +966,20 @@ def initialize_track_covariance(
         5.0,
     )
 
-    return np.diag([
-        (2.0 * sigma_range) ** 2,
-        (2.0 * sigma_cross) ** 2,
-        velocity_sigma_init**2,
-        velocity_sigma_init**2,
+    P_vel = (
+        velocity_sigma_init**2
+        * np.eye(3)
+    )
+
+    return np.block([
+        [
+            P_pos,
+            np.zeros((3, 3)),
+        ],
+        [
+            np.zeros((3, 3)),
+            P_vel,
+        ],
     ])
 
 
@@ -654,10 +995,7 @@ def kalman_covariance_step(
     apply_availability_weighting: bool = True,
 ):
     """
-    Sequential constant-velocity covariance propagation.
-
-    Measurement covariance is rotated into the instantaneous LOS geometry and is
-    explicitly degraded as detection / measurement availability falls.
+    Sequential 3-D constant-velocity covariance propagation.
     """
     dt_s = max(
         float(dt_s),
@@ -672,7 +1010,9 @@ def kalman_covariance_step(
         )
     )
 
-    F = cv_transition(dt_s)
+    F = cv_transition(
+        dt_s
+    )
     Q = cv_process_noise(
         dt_s,
         maneuver_accel_sigma,
@@ -683,20 +1023,24 @@ def kalman_covariance_step(
     )
 
     if measurement_update:
-        R, _, _, _ = track_measurement_covariance(
-            env,
-            sensors,
-            position_m=position_m,
-            detection_probability_value=detection_probability_value,
-            apply_availability_weighting=apply_availability_weighting,
+        R, _, _, _, _ = (
+            track_measurement_covariance(
+                env,
+                sensors,
+                position_m=position_m,
+                detection_probability_value=detection_probability_value,
+                apply_availability_weighting=apply_availability_weighting,
+            )
         )
 
-        H = np.array([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
+        H = np.block([
+            [
+                np.eye(3),
+                np.zeros((3, 3)),
+            ]
         ])
 
-        I4 = np.eye(4)
+        I6 = np.eye(6)
 
         S = (
             H @ P_pred @ H.T + R
@@ -707,8 +1051,8 @@ def kalman_covariance_step(
             @ np.linalg.inv(S)
         )
 
-        # Joseph stabilized covariance update.
-        A = I4 - K @ H
+        A = I6 - K @ H
+
         P_post = (
             A @ P_pred @ A.T
             + K @ R @ K.T
@@ -727,19 +1071,22 @@ def covariance_metrics(
     position_m: np.ndarray | None = None,
 ):
     """
-    Convert the sequential fixed-Cartesian covariance into instantaneous LOS-frame
-    engineering metrics.
-
-    The position and velocity covariance blocks are projected onto the current radial
-    and transverse directions instead of assuming that global x/y remain radial/cross-range.
+    Project the 6-state Cartesian covariance into the instantaneous 3-D LOS frame.
     """
     if position_m is None:
-        position_m = np.array(
-            [env.range_km * 1000.0, 0.0],
-            dtype=float,
+        position_m = (
+            target_initial_position_m(
+                env,
+                tgt,
+            )
         )
 
-    u_r, u_t, range_m = los_basis_from_position(
+    (
+        u_r,
+        u_az,
+        u_el,
+        range_m,
+    ) = los_basis_from_position(
         position_m
     )
 
@@ -774,40 +1121,81 @@ def covariance_metrics(
     else:
         P_eval = P_filter.copy()
 
-    P_pos = P_eval[:2, :2]
-    P_vel = P_eval[2:, 2:]
+    P_pos = P_eval[:3, :3]
+    P_vel = P_eval[3:, 3:]
 
-    radial_var_m2 = float(
-        u_r.T @ P_pos @ u_r
+    def projected_sigma(
+        covariance,
+        axis,
+    ):
+        return math.sqrt(
+            max(
+                float(
+                    axis.T
+                    @ covariance
+                    @ axis
+                ),
+                0.0,
+            )
+        )
+
+    radial_sigma_m = projected_sigma(
+        P_pos,
+        u_r,
     )
-    cross_var_m2 = float(
-        u_t.T @ P_pos @ u_t
+    az_cross_sigma_m = projected_sigma(
+        P_pos,
+        u_az,
+    )
+    el_cross_sigma_m = projected_sigma(
+        P_pos,
+        u_el,
     )
 
-    radial_velocity_var = float(
-        u_r.T @ P_vel @ u_r
+    radial_velocity_sigma_mps = projected_sigma(
+        P_vel,
+        u_r,
     )
-    cross_velocity_var = float(
-        u_t.T @ P_vel @ u_t
+    az_velocity_sigma_mps = projected_sigma(
+        P_vel,
+        u_az,
     )
-
-    radial_sigma_m = math.sqrt(
-        max(radial_var_m2, 0.0)
-    )
-    cross_sigma_m = math.sqrt(
-        max(cross_var_m2, 0.0)
-    )
-    radial_velocity_sigma_mps = math.sqrt(
-        max(radial_velocity_var, 0.0)
-    )
-    cross_velocity_sigma_mps = math.sqrt(
-        max(cross_velocity_var, 0.0)
+    el_velocity_sigma_mps = projected_sigma(
+        P_vel,
+        u_el,
     )
 
-    angular_sigma_mrad = (
-        cross_sigma_m
+    horizontal_range_m = max(
+        math.hypot(
+            float(position_m[0]),
+            float(position_m[1]),
+        ),
+        1e-6,
+    )
+    cos_elevation = clamp(
+        horizontal_range_m / range_m,
+        1e-6,
+        1.0,
+    )
+
+    az_angular_sigma_mrad = (
+        az_cross_sigma_m
+        / max(
+            range_m * cos_elevation,
+            1e-6,
+        )
+        * 1000.0
+    )
+    el_angular_sigma_mrad = (
+        el_cross_sigma_m
         / range_m
         * 1000.0
+    )
+
+    # Conservative scalar angular uncertainty for the low-order aimpoint model.
+    angular_sigma_mrad = max(
+        az_angular_sigma_mrad,
+        el_angular_sigma_mrad,
     )
 
     target_angular_radius_mrad = (
@@ -830,10 +1218,22 @@ def covariance_metrics(
         "filter_covariance": P_filter,
         "latency_predicted_covariance": P_eval,
         "radial_sigma_m": radial_sigma_m,
-        "cross_sigma_m": cross_sigma_m,
+        "cross_sigma_m": max(
+            az_cross_sigma_m,
+            el_cross_sigma_m,
+        ),
+        "az_cross_sigma_m": az_cross_sigma_m,
+        "el_cross_sigma_m": el_cross_sigma_m,
         "radial_velocity_sigma_mps": radial_velocity_sigma_mps,
-        "cross_velocity_sigma_mps": cross_velocity_sigma_mps,
+        "cross_velocity_sigma_mps": max(
+            az_velocity_sigma_mps,
+            el_velocity_sigma_mps,
+        ),
+        "az_velocity_sigma_mps": az_velocity_sigma_mps,
+        "el_velocity_sigma_mps": el_velocity_sigma_mps,
         "angular_sigma_mrad": angular_sigma_mrad,
+        "az_angular_sigma_mrad": az_angular_sigma_mrad,
+        "el_angular_sigma_mrad": el_angular_sigma_mrad,
         "target_angular_radius_mrad": target_angular_radius_mrad,
         "track_quality": track_quality,
     }
@@ -845,11 +1245,13 @@ def track_covariance_metrics(
     sensors: SensorState,
 ):
     """
-    Convenience snapshot wrapper retained for diagnostic use only.
+    Convenience 3-D snapshot wrapper retained for diagnostics.
     """
-    position_m = np.array(
-        [env.range_km * 1000.0, 0.0],
-        dtype=float,
+    position_m = (
+        target_initial_position_m(
+            env,
+            tgt,
+        )
     )
 
     P = initialize_track_covariance(
@@ -866,8 +1268,27 @@ def track_covariance_metrics(
         )
     )
 
+    slant_env = Environment(
+        range_km=max(
+            float(
+                np.linalg.norm(
+                    position_m
+                )
+            ) / 1000.0,
+            0.001,
+        ),
+        humidity_pct=env.humidity_pct,
+        visibility_km=env.visibility_km,
+        turbulence=env.turbulence,
+        wind_mps=env.wind_mps,
+        ambient_temp_c=env.ambient_temp_c,
+        angstrom_exponent=env.angstrom_exponent,
+        humidity_absorption_km_inv_at_100pct=env.humidity_absorption_km_inv_at_100pct,
+        wind_pointing_sensitivity_urad_per_mps=env.wind_pointing_sensitivity_urad_per_mps,
+    )
+
     p_detect = detection_probability(
-        env,
+        slant_env,
         tgt,
         sensors,
     )
@@ -875,7 +1296,7 @@ def track_covariance_metrics(
     for _ in range(12):
         P = kalman_covariance_step(
             P,
-            env,
+            slant_env,
             tgt,
             sensors,
             update_dt,
@@ -886,7 +1307,7 @@ def track_covariance_metrics(
 
     return covariance_metrics(
         P,
-        env,
+        slant_env,
         tgt,
         sensors,
         position_m=position_m,
@@ -897,19 +1318,133 @@ def track_covariance_metrics(
 # Pointing and beam geometry
 # ============================================================
 
-def pointing_jitter_components(
+def wrap_angle_rad(angle_rad: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return (
+        angle_rad + math.pi
+    ) % (
+        2.0 * math.pi
+    ) - math.pi
+
+
+def beam_director_state_step(
+    commanded_los_angle_rad: float,
+    director_angle_rad: float,
+    hel: HELState,
+    dt_s: float,
+):
+    """
+    Propagate a generic first-order beam-director state with an angular-rate limit.
+
+    The unsaturated first-order response is integrated analytically over dt:
+
+        delta_theta_first_order
+            = error * (1 - exp(-dt / tau))
+
+    Then the physical angular motion over the interval is rate-limited:
+
+        |delta_theta| <= omega_max * dt
+
+    This avoids explicit-Euler instability when dt is large relative to the servo
+    time constant. The residual servo tracking error is deterministic, not a 1σ
+    random uncertainty.
+    """
+    tau_s = max(
+        hel.beam_director_servo_time_constant_s,
+        1e-6,
+    )
+    max_rate_rad_s = max(
+        hel.beam_director_max_rate_mrad_s / 1000.0,
+        1e-9,
+    )
+    dt_s = max(
+        float(dt_s),
+        0.0,
+    )
+
+    error_rad = wrap_angle_rad(
+        commanded_los_angle_rad
+        - director_angle_rad
+    )
+
+    # Exact first-order response for constant commanded LOS angle over the step.
+    response_fraction = (
+        1.0
+        - math.exp(
+            -dt_s / tau_s
+        )
+        if dt_s > 0.0
+        else 0.0
+    )
+
+    desired_delta_rad = (
+        error_rad
+        * response_fraction
+    )
+
+    max_delta_rad = (
+        max_rate_rad_s
+        * dt_s
+    )
+
+    actual_delta_rad = float(
+        np.clip(
+            desired_delta_rad,
+            -max_delta_rad,
+            max_delta_rad,
+        )
+    )
+
+    new_director_angle_rad = wrap_angle_rad(
+        director_angle_rad
+        + actual_delta_rad
+    )
+
+    residual_error_rad = wrap_angle_rad(
+        commanded_los_angle_rad
+        - new_director_angle_rad
+    )
+
+    actual_rate_rad_s = (
+        actual_delta_rad / dt_s
+        if dt_s > 1e-12
+        else 0.0
+    )
+
+    desired_average_rate_rad_s = (
+        desired_delta_rad / dt_s
+        if dt_s > 1e-12
+        else 0.0
+    )
+
+    rate_utilization = (
+        abs(actual_rate_rad_s)
+        / max_rate_rad_s
+    )
+    rate_demand_ratio = (
+        abs(desired_average_rate_rad_s)
+        / max_rate_rad_s
+    )
+
+    return {
+        "director_angle_rad": new_director_angle_rad,
+        "actual_rate_mrad_s": actual_rate_rad_s * 1000.0,
+        "unsaturated_rate_mrad_s": desired_average_rate_rad_s * 1000.0,
+        "servo_tracking_error_mrad": abs(residual_error_rad) * 1000.0,
+        "rate_utilization": rate_utilization,
+        "rate_demand_ratio": rate_demand_ratio,
+        "rate_saturated": abs(desired_delta_rad) > max_delta_rad + 1e-15,
+    }
+
+
+def stochastic_pointing_sigma_mrad(
     env: Environment,
     hel: HELState,
     tracking_angular_sigma_mrad: float,
-    los_rate_mrad_s: float,
 ):
     """
-    Low-order beam-director pointing model.
-
-    A first-order servo lag term is driven by instantaneous LOS rate. Once the
-    commanded LOS rate exceeds the configured beam-director rate limit, an additional
-    saturation penalty is added. These are generic engineering abstractions rather
-    than a model of any specific gimbal or beam-control system.
+    RSS combination of stochastic / uncertainty-like pointing contributors only.
+    Deterministic beam-director lag is handled separately.
     """
     wind_jitter_mrad = (
         env.wind_mps
@@ -921,56 +1456,34 @@ def pointing_jitter_components(
         0.04 * env.turbulence
     )
 
-    max_rate = max(
-        hel.beam_director_max_rate_mrad_s,
-        1e-6,
-    )
-
-    rate_utilization = (
-        abs(los_rate_mrad_s)
-        / max_rate
-    )
-
-    nominal_servo_error_mrad = (
-        hel.beam_director_servo_time_constant_s
-        * min(
-            abs(los_rate_mrad_s),
-            max_rate,
-        )
-    )
-
-    excess_rate_mrad_s = max(
-        0.0,
-        abs(los_rate_mrad_s)
-        - max_rate,
-    )
-
-    saturation_error_mrad = (
-        4.0
-        * hel.beam_director_servo_time_constant_s
-        * excess_rate_mrad_s
-    )
-
-    servo_error_mrad = (
-        nominal_servo_error_mrad
-        + saturation_error_mrad
-    )
-
-    total_mrad = math.sqrt(
+    sigma_mrad = math.sqrt(
         hel.base_pointing_jitter_mrad**2
         + wind_jitter_mrad**2
         + turbulence_wander_mrad**2
         + tracking_angular_sigma_mrad**2
-        + servo_error_mrad**2
     )
 
     return {
-        "total_mrad": total_mrad,
+        "sigma_mrad": sigma_mrad,
         "wind_mrad": wind_jitter_mrad,
         "turbulence_mrad": turbulence_wander_mrad,
-        "servo_mrad": servo_error_mrad,
-        "rate_utilization": rate_utilization,
     }
+
+
+def effective_pointing_error_mrad(
+    stochastic_sigma_mrad: float,
+    servo_tracking_error_mrad: float,
+) -> float:
+    """
+    Effective RMS-like pointing error used by the low-order engagement-footprint model.
+
+    The servo term is a deterministic lag, so this quantity is deliberately not
+    labeled as a statistical 1σ value.
+    """
+    return math.sqrt(
+        max(stochastic_sigma_mrad, 0.0) ** 2
+        + max(servo_tracking_error_mrad, 0.0) ** 2
+    )
 
 
 def pointing_jitter_mrad(
@@ -979,18 +1492,21 @@ def pointing_jitter_mrad(
     tracking_angular_sigma_mrad: float,
     los_rate_mrad_s: float = 0.0,
 ) -> float:
-    return pointing_jitter_components(
+    """
+    Legacy diagnostic helper. It returns stochastic pointing uncertainty only.
+    The authoritative dynamic model uses beam_director_state_step() explicitly.
+    """
+    return stochastic_pointing_sigma_mrad(
         env,
         hel,
         tracking_angular_sigma_mrad,
-        los_rate_mrad_s,
-    )["total_mrad"]
+    )["sigma_mrad"]
 
 
 def beam_spot_geometry(
     env: Environment,
     hel: HELState,
-    combined_pointing_sigma_mrad: float,
+    effective_pointing_mrad: float,
 ):
     """
     Low-order effective spot model.
@@ -1031,7 +1547,7 @@ def beam_spot_geometry(
     )
 
     pointing_sigma_rad = (
-        combined_pointing_sigma_mrad
+        effective_pointing_mrad
         / 1000.0
     )
 
@@ -1069,7 +1585,7 @@ def beam_spot_geometry(
 def aimpoint_margin_index(
     env: Environment,
     tgt: Target,
-    combined_pointing_sigma_mrad: float,
+    effective_pointing_mrad: float,
 ) -> float:
     """
     Dimensionless margin index based on angular target radius relative to
@@ -1087,7 +1603,7 @@ def aimpoint_margin_index(
     )
 
     ratio = (
-        combined_pointing_sigma_mrad
+        effective_pointing_mrad
         / allowable_mrad
     )
 
@@ -1541,6 +2057,21 @@ def simulate_static_snapshot(
                 0.0,
                 180.0,
             ),
+            initial_altitude_m=max(
+                0.0,
+                random.gauss(
+                    tgt.initial_altitude_m,
+                    max(25.0, 0.03 * max(tgt.initial_altitude_m, 1.0)),
+                ),
+            ),
+            flight_path_angle_deg=clamp(
+                random.gauss(
+                    tgt.flight_path_angle_deg,
+                    2.0,
+                ),
+                -60.0,
+                45.0,
+            ),
             aspect_factor=clamp(
                 random.gauss(
                     tgt.aspect_factor,
@@ -1782,11 +2313,10 @@ def simulate_static_snapshot(
         sensors,
     )
 
-    # Couple detection/classification confidence to covariance-derived track quality.
-    track_quality = clamp(
-        track["track_quality"]
-        * (0.65 + 0.20 * p_detect + 0.15 * class_conf)
-    )
+    # Track quality is derived only from estimator covariance.
+    # Detection already influences covariance through measurement availability,
+    # while classification remains an independent decision-support variable.
+    track_quality = track["track_quality"]
 
     dwell_s = effective_dwell_time_s(
         env,
@@ -1811,19 +2341,30 @@ def simulate_static_snapshot(
         tgt,
     )
 
-    static_pointing = pointing_jitter_components(
+    static_stochastic_pointing = stochastic_pointing_sigma_mrad(
         env,
         hel,
         track["angular_sigma_mrad"],
-        static_los_rate_mrad_s,
     )
 
-    combined_pointing_sigma_mrad = static_pointing["total_mrad"]
+    # Diagnostic snapshot approximation: initialize the director on the current LOS,
+    # so no fictitious transient servo bias is injected into a non-time-stepped view.
+    static_servo_error_mrad = 0.0
+    static_rate_utilization = min(
+        1.0,
+        abs(static_los_rate_mrad_s)
+        / max(hel.beam_director_max_rate_mrad_s, 1e-6),
+    )
+
+    effective_pointing_mrad = effective_pointing_error_mrad(
+        static_stochastic_pointing["sigma_mrad"],
+        static_servo_error_mrad,
+    )
 
     beam = beam_spot_geometry(
         env,
         hel,
-        combined_pointing_sigma_mrad,
+        effective_pointing_mrad,
     )
 
     target_optical_power_kw = (
@@ -1840,7 +2381,7 @@ def simulate_static_snapshot(
     aim_margin = aimpoint_margin_index(
         env,
         tgt,
-        combined_pointing_sigma_mrad,
+        effective_pointing_mrad,
     )
 
     target_thermal = target_thermal_response(
@@ -1869,7 +2410,7 @@ def simulate_static_snapshot(
         platform_state["energy_margin"],
         platform_state["power_availability_ratio"],
         dwell_s,
-        beam_director_rate_utilization=static_pointing["rate_utilization"],
+        beam_director_rate_utilization=static_rate_utilization,
     )
 
     return {
@@ -1901,9 +2442,9 @@ def simulate_static_snapshot(
         "Target Optical Power (kW)": target_optical_power_kw,
         "Diffraction Half-Angle (mrad)": beam["diffraction_half_angle_mrad"],
         "Effective Beam Half-Angle (mrad)": beam["effective_half_angle_divergence_mrad"],
-        "Combined Pointing 1σ (mrad)": combined_pointing_sigma_mrad,
-        "Servo Pointing 1σ (mrad)": static_pointing["servo_mrad"],
-        "Beam Director Rate Utilization": static_pointing["rate_utilization"],
+        "Effective Pointing Error (mrad)": effective_pointing_mrad,
+        "Servo Tracking Error (mrad)": static_servo_error_mrad,
+        "Beam Director Rate Utilization": static_rate_utilization,
         "Spot Diameter (m)": beam["spot_diameter_m"],
         "Average Irradiance (kW/m^2)": average_irradiance_kw_m2,
         "Absorbed Heat Flux (kW/m^2)": target_thermal["absorbed_heat_flux_kw_m2"],
@@ -1978,46 +2519,77 @@ def simulate_time_stepped_engagement(
     stochastic_measurements: bool = False,
 ):
     """
-    Authoritative engagement engine.
+    Authoritative true 3-D constant-velocity engagement engine.
 
-    Corrections implemented in this version:
-      * covariance is projected into the instantaneous LOS frame;
-      * detection probability is separated from downstream data dropout;
-      * deterministic tracking uses availability-weighted measurement information;
-      * Monte Carlo uses Bernoulli received/missed measurements with nominal R on receipt;
-      * beam-director servo error and rate saturation are driven by instantaneous LOS rate;
-      * interval physics uses midpoint geometry while displayed state uses exact endpoints.
+    State geometry is propagated in x, y, z. Slant range, CPA, LOS azimuth/elevation,
+    two-axis beam-director tracking, measurement covariance, atmosphere, beam footprint,
+    power/thermal state, and target heating all use the same 3-D trajectory.
     """
     geometry = engagement_geometry(
         env,
         tgt,
     )
-    horizon_s = geometry["engagement_horizon_s"]
+    horizon_s = geometry[
+        "engagement_horizon_s"
+    ]
 
     total_time_s = min(
         hel.commanded_dwell_time_s,
         horizon_s,
     )
 
-    if not math.isfinite(total_time_s):
-        total_time_s = hel.commanded_dwell_time_s
+    if not math.isfinite(
+        total_time_s
+    ):
+        total_time_s = (
+            hel.commanded_dwell_time_s
+        )
 
     total_time_s = max(
         0.0,
         total_time_s,
     )
 
+    r0 = target_initial_position_m(
+        env,
+        tgt,
+    )
+    velocity_mps = (
+        target_velocity_vector_mps(
+            tgt
+        )
+    )
+
+    initial_slant_range_m = max(
+        float(np.linalg.norm(r0)),
+        1.0,
+    )
+    initial_los = (
+        instantaneous_los_axis_rates_mrad_s(
+            r0,
+            velocity_mps,
+        )
+    )
+
     if total_time_s <= 0.0:
+        slant_env = Environment(
+            range_km=initial_slant_range_m / 1000.0,
+            humidity_pct=env.humidity_pct,
+            visibility_km=env.visibility_km,
+            turbulence=env.turbulence,
+            wind_mps=env.wind_mps,
+            ambient_temp_c=env.ambient_temp_c,
+            angstrom_exponent=env.angstrom_exponent,
+            humidity_absorption_km_inv_at_100pct=env.humidity_absorption_km_inv_at_100pct,
+            wind_pointing_sensitivity_urad_per_mps=env.wind_pointing_sensitivity_urad_per_mps,
+        )
         atmosphere_zero = atmospheric_extinction(
-            env,
+            slant_env,
             hel,
         )
-        initial_los_rate = line_of_sight_rate_mrad_s(
-            env,
-            tgt,
-        )
+
         rate_utilization = (
-            initial_los_rate
+            initial_los["magnitude_mrad_s"]
             / max(
                 hel.beam_director_max_rate_mrad_s,
                 1e-6,
@@ -2029,17 +2601,23 @@ def simulate_time_stepped_engagement(
             "Classification Confidence": 0.0,
             "Track Quality": 0.0,
             "Track Cross-Range 1σ (m)": float("nan"),
+            "Track Azimuth Cross-Range 1σ (m)": float("nan"),
+            "Track Elevation Cross-Range 1σ (m)": float("nan"),
             "Track Radial 1σ (m)": float("nan"),
             "Track Angular 1σ (mrad)": float("nan"),
+            "Track Azimuth 1σ (mrad)": float("nan"),
+            "Track Elevation 1σ (mrad)": float("nan"),
             "Target Angular Radius (mrad)": (
                 tgt.characteristic_radius_m
-                / max(
-                    env.range_km * 1000.0,
-                    1.0,
-                )
+                / initial_slant_range_m
                 * 1000.0
             ),
-            "LOS Rate (mrad/s)": initial_los_rate,
+            "LOS Rate (mrad/s)": initial_los["magnitude_mrad_s"],
+            "Azimuth LOS Rate (mrad/s)": initial_los["azimuth_rate_mrad_s"],
+            "Elevation LOS Rate (mrad/s)": initial_los["elevation_rate_mrad_s"],
+            "Azimuth (deg)": math.degrees(initial_los["azimuth_rad"]),
+            "Elevation Angle (deg)": math.degrees(initial_los["elevation_rad"]),
+            "Altitude (m)": float(r0[2]),
             "Measurement Availability": 0.0,
             "Aimpoint Margin Index": 0.0,
             "Atmospheric Transmission": atmosphere_zero["transmission"],
@@ -2049,6 +2627,7 @@ def simulate_time_stepped_engagement(
             "Optical Depth": atmosphere_zero["optical_depth"],
             "Available Engagement Time (s)": 0.0,
             "Time to CPA (s)": geometry["time_to_cpa_s"],
+            "Time to Ground Impact (s)": geometry["time_to_ground_impact_s"],
             "CPA Range (m)": geometry["cpa_range_m"],
             "Effective Dwell Time (s)": 0.0,
             "Requested Optical Source Power (kW)": hel.requested_optical_source_power_kw,
@@ -2061,9 +2640,14 @@ def simulate_time_stepped_engagement(
             "Target Optical Power (kW)": 0.0,
             "Diffraction Half-Angle (mrad)": 0.0,
             "Effective Beam Half-Angle (mrad)": 0.0,
-            "Combined Pointing 1σ (mrad)": float("nan"),
-            "Servo Pointing 1σ (mrad)": float("nan"),
-            "Beam Director Rate Utilization": rate_utilization,
+            "Effective Pointing Error (mrad)": float("nan"),
+            "Stochastic Pointing 1σ (mrad)": float("nan"),
+            "Servo Tracking Error (mrad)": float("nan"),
+            "Azimuth Servo Error (mrad)": float("nan"),
+            "Elevation Servo Error (mrad)": float("nan"),
+            "Beam Director Rate Utilization": min(rate_utilization, 1.0),
+            "Beam Director Rate Demand Ratio": rate_utilization,
+            "Beam Director Rate Saturated": rate_utilization > 1.0,
             "Spot Diameter (m)": float("nan"),
             "Average Irradiance (kW/m^2)": 0.0,
             "Absorbed Heat Flux (kW/m^2)": 0.0,
@@ -2082,7 +2666,10 @@ def simulate_time_stepped_engagement(
             "Net Heat Load (kW)": 0.0,
             "Readiness Score": 0.0,
             "Recommendation": "HOLD: Insufficient engagement time",
-            "Final Range (km)": env.range_km,
+            "Final Range (km)": initial_slant_range_m / 1000.0,
+            "X (km)": float(r0[0]) / 1000.0,
+            "Y (km)": float(r0[1]) / 1000.0,
+            "Z (km)": float(r0[2]) / 1000.0,
         }
 
     integration_dt = max(
@@ -2111,29 +2698,15 @@ def simulate_time_stepped_engagement(
         total_time_s / steps
     )
 
-    radial_closing, transverse = target_velocity_components_mps(
-        tgt
+    target_temp_c = (
+        env.ambient_temp_c
     )
-
-    r0 = np.array(
-        [
-            env.range_km * 1000.0,
-            0.0,
-        ],
-        dtype=float,
+    coolant_temp_c = (
+        platform.coolant_temp_c
     )
-
-    velocity_mps = np.array(
-        [
-            -radial_closing,
-            transverse,
-        ],
-        dtype=float,
+    stored_energy_kwh = (
+        platform.stored_energy_kwh
     )
-
-    target_temp_c = env.ambient_temp_c
-    coolant_temp_c = platform.coolant_temp_c
-    stored_energy_kwh = platform.stored_energy_kwh
     absorbed_exposure_kj_m2 = 0.0
 
     P_filter = initialize_track_covariance(
@@ -2149,8 +2722,29 @@ def simulate_time_stepped_engagement(
             0.1,
         )
     )
+    measurement_accumulator_s = (
+        measurement_period_s
+    )
 
-    measurement_accumulator_s = measurement_period_s
+    initial_az_rad = math.atan2(
+        r0[1],
+        r0[0],
+    )
+    initial_el_rad = math.atan2(
+        r0[2],
+        math.hypot(
+            r0[0],
+            r0[1],
+        ),
+    )
+
+    director_azimuth_rad = (
+        initial_az_rad
+    )
+    director_elevation_rad = (
+        initial_el_rad
+    )
+
     rows = []
 
     for k in range(steps):
@@ -2163,11 +2757,15 @@ def simulate_time_stepped_engagement(
             * dt_actual
         )
 
-        # Midpoint geometry for interval-integrated physics.
         position_mid_m = (
             r0
             + velocity_mps * t_mid
         )
+        position_end_m = (
+            r0
+            + velocity_mps * elapsed_s
+        )
+
         range_mid_m = max(
             float(
                 np.linalg.norm(
@@ -2176,15 +2774,6 @@ def simulate_time_stepped_engagement(
             ),
             1.0,
         )
-        range_mid_km = (
-            range_mid_m / 1000.0
-        )
-
-        # Exact endpoint geometry for state reporting and measurement update.
-        position_end_m = (
-            r0
-            + velocity_mps * elapsed_s
-        )
         range_end_m = max(
             float(
                 np.linalg.norm(
@@ -2192,6 +2781,10 @@ def simulate_time_stepped_engagement(
                 )
             ),
             1.0,
+        )
+
+        range_mid_km = (
+            range_mid_m / 1000.0
         )
         range_end_km = (
             range_end_m / 1000.0
@@ -2232,13 +2825,11 @@ def simulate_time_stepped_engagement(
             subsystem_health=platform.subsystem_health,
         )
 
-        # Detection is evaluated at the actual measurement endpoint.
         p_detect = detection_probability(
             end_env,
             tgt,
             sensors,
         )
-
         class_conf = classification_confidence(
             p_detect,
             sensors,
@@ -2255,7 +2846,9 @@ def simulate_time_stepped_engagement(
             1.0,
         )
 
-        measurement_accumulator_s += dt_actual
+        measurement_accumulator_s += (
+            dt_actual
+        )
         scheduled_measurement = (
             measurement_accumulator_s
             + 1e-12
@@ -2269,8 +2862,6 @@ def simulate_time_stepped_engagement(
                     < measurement_availability
                 )
             else:
-                # Deterministic mode retains repeatability. Scheduled updates remain
-                # deterministic while R is information-weighted by Pd * (1 - dropout).
                 do_measurement_update = (
                     measurement_availability
                     > 0.02
@@ -2291,9 +2882,8 @@ def simulate_time_stepped_engagement(
         )
 
         if scheduled_measurement:
-            measurement_accumulator_s = (
-                measurement_accumulator_s
-                - measurement_period_s
+            measurement_accumulator_s -= (
+                measurement_period_s
             )
 
         track = covariance_metrics(
@@ -2303,14 +2893,8 @@ def simulate_time_stepped_engagement(
             sensors,
             position_m=position_end_m,
         )
-
-        track_quality = clamp(
+        track_quality = (
             track["track_quality"]
-            * (
-                0.65
-                + 0.20 * p_detect
-                + 0.15 * class_conf
-            )
         )
 
         atmosphere = atmospheric_extinction(
@@ -2325,34 +2909,90 @@ def simulate_time_stepped_engagement(
             dt_actual,
         )
 
-        los_rate_mrad_s = (
-            instantaneous_los_rate_mrad_s(
-                position_end_m,
-                velocity_mps,
+        los = instantaneous_los_axis_rates_mrad_s(
+            position_end_m,
+            velocity_mps,
+        )
+
+        commanded_azimuth_rad = (
+            los["azimuth_rad"]
+        )
+        commanded_elevation_rad = (
+            los["elevation_rad"]
+        )
+
+        az_state = beam_director_state_step(
+            commanded_azimuth_rad,
+            director_azimuth_rad,
+            hel,
+            dt_actual,
+        )
+        el_state = beam_director_state_step(
+            commanded_elevation_rad,
+            director_elevation_rad,
+            hel,
+            dt_actual,
+        )
+
+        director_azimuth_rad = (
+            az_state["director_angle_rad"]
+        )
+        director_elevation_rad = (
+            el_state["director_angle_rad"]
+        )
+
+        stochastic_pointing = (
+            stochastic_pointing_sigma_mrad(
+                mid_env,
+                hel,
+                track["angular_sigma_mrad"],
             )
         )
 
-        pointing = pointing_jitter_components(
-            mid_env,
-            hel,
-            track["angular_sigma_mrad"],
-            los_rate_mrad_s,
+        az_servo_error_mrad = (
+            az_state[
+                "servo_tracking_error_mrad"
+            ]
+            * abs(
+                math.cos(
+                    commanded_elevation_rad
+                )
+            )
+        )
+        el_servo_error_mrad = (
+            el_state[
+                "servo_tracking_error_mrad"
+            ]
         )
 
-        combined_pointing_sigma_mrad = (
-            pointing["total_mrad"]
+        servo_tracking_error_mrad = math.sqrt(
+            az_servo_error_mrad**2
+            + el_servo_error_mrad**2
+        )
+
+        effective_pointing_mrad = (
+            effective_pointing_error_mrad(
+                stochastic_pointing[
+                    "sigma_mrad"
+                ],
+                servo_tracking_error_mrad,
+            )
         )
 
         beam = beam_spot_geometry(
             mid_env,
             hel,
-            combined_pointing_sigma_mrad,
+            effective_pointing_mrad,
         )
 
         target_optical_power_kw = (
-            step_power["actual_optical_kw"]
+            step_power[
+                "actual_optical_kw"
+            ]
             * hel.optics_efficiency
-            * atmosphere["transmission"]
+            * atmosphere[
+                "transmission"
+            ]
         )
 
         average_irradiance_kw_m2 = (
@@ -2363,14 +3003,13 @@ def simulate_time_stepped_engagement(
         aim_margin = aimpoint_margin_index(
             end_env,
             tgt,
-            combined_pointing_sigma_mrad,
+            effective_pointing_mrad,
         )
 
         c_areal = max(
             tgt.areal_heat_capacity_kj_m2k,
             1e-6,
         )
-
         absorbed_flux_kw_m2 = (
             clamp(
                 tgt.absorptivity
@@ -2445,7 +3084,6 @@ def simulate_time_stepped_engagement(
         coolant_temp_c = (
             step_power["new_temp_c"]
         )
-
         stored_energy_kwh = (
             step_power[
                 "energy_remaining_kwh"
@@ -2465,12 +3103,35 @@ def simulate_time_stepped_engagement(
             class_conf,
             track_quality,
             thermal_effect_index,
-            step_power["thermal_margin"],
+            step_power[
+                "thermal_margin"
+            ],
             energy_margin,
             step_power[
                 "power_availability_ratio"
             ],
             platform.subsystem_health,
+        )
+
+        director_rate_utilization = max(
+            az_state[
+                "rate_utilization"
+            ],
+            el_state[
+                "rate_utilization"
+            ],
+        )
+        director_rate_demand_ratio = max(
+            az_state[
+                "rate_demand_ratio"
+            ],
+            el_state[
+                "rate_demand_ratio"
+            ],
+        )
+        director_rate_saturated = (
+            az_state["rate_saturated"]
+            or el_state["rate_saturated"]
         )
 
         recommendation = engagement_recommendation(
@@ -2479,9 +3140,11 @@ def simulate_time_stepped_engagement(
             aim_margin,
             step_power["thermal_margin"],
             energy_margin,
-            step_power["power_availability_ratio"],
+            step_power[
+                "power_availability_ratio"
+            ],
             elapsed_s,
-            beam_director_rate_utilization=pointing["rate_utilization"],
+            beam_director_rate_utilization=director_rate_demand_ratio,
         )
 
         state = {
@@ -2489,15 +3152,27 @@ def simulate_time_stepped_engagement(
             "Range (km)": range_end_km,
             "Physics Evaluation Range (km)": range_mid_km,
             "Final Range (km)": range_end_km,
+            "X (km)": float(position_end_m[0]) / 1000.0,
+            "Y (km)": float(position_end_m[1]) / 1000.0,
+            "Z (km)": float(position_end_m[2]) / 1000.0,
+            "Altitude (m)": float(position_end_m[2]),
+            "Azimuth (deg)": math.degrees(commanded_azimuth_rad),
+            "Elevation Angle (deg)": math.degrees(commanded_elevation_rad),
             "Detection Probability": p_detect,
             "Classification Confidence": class_conf,
             "Measurement Availability": measurement_availability,
             "Track Quality": track_quality,
             "Track Cross-Range 1σ (m)": track["cross_sigma_m"],
+            "Track Azimuth Cross-Range 1σ (m)": track["az_cross_sigma_m"],
+            "Track Elevation Cross-Range 1σ (m)": track["el_cross_sigma_m"],
             "Track Radial 1σ (m)": track["radial_sigma_m"],
             "Track Angular 1σ (mrad)": track["angular_sigma_mrad"],
+            "Track Azimuth 1σ (mrad)": track["az_angular_sigma_mrad"],
+            "Track Elevation 1σ (mrad)": track["el_angular_sigma_mrad"],
             "Target Angular Radius (mrad)": track["target_angular_radius_mrad"],
-            "LOS Rate (mrad/s)": los_rate_mrad_s,
+            "LOS Rate (mrad/s)": los["magnitude_mrad_s"],
+            "Azimuth LOS Rate (mrad/s)": los["azimuth_rate_mrad_s"],
+            "Elevation LOS Rate (mrad/s)": los["elevation_rate_mrad_s"],
             "Aimpoint Margin Index": aim_margin,
             "Atmospheric Transmission": atmosphere["transmission"],
             "Aerosol Extinction (1/km)": atmosphere["aerosol_extinction_km_inv"],
@@ -2506,6 +3181,7 @@ def simulate_time_stepped_engagement(
             "Optical Depth": atmosphere["optical_depth"],
             "Available Engagement Time (s)": geometry["engagement_horizon_s"],
             "Time to CPA (s)": geometry["time_to_cpa_s"],
+            "Time to Ground Impact (s)": geometry["time_to_ground_impact_s"],
             "CPA Range (m)": geometry["cpa_range_m"],
             "Effective Dwell Time (s)": elapsed_s,
             "Requested Optical Source Power (kW)": hel.requested_optical_source_power_kw,
@@ -2518,9 +3194,14 @@ def simulate_time_stepped_engagement(
             "Target Optical Power (kW)": target_optical_power_kw,
             "Diffraction Half-Angle (mrad)": beam["diffraction_half_angle_mrad"],
             "Effective Beam Half-Angle (mrad)": beam["effective_half_angle_divergence_mrad"],
-            "Combined Pointing 1σ (mrad)": combined_pointing_sigma_mrad,
-            "Servo Pointing 1σ (mrad)": pointing["servo_mrad"],
-            "Beam Director Rate Utilization": pointing["rate_utilization"],
+            "Effective Pointing Error (mrad)": effective_pointing_mrad,
+            "Stochastic Pointing 1σ (mrad)": stochastic_pointing["sigma_mrad"],
+            "Servo Tracking Error (mrad)": servo_tracking_error_mrad,
+            "Azimuth Servo Error (mrad)": az_servo_error_mrad,
+            "Elevation Servo Error (mrad)": el_servo_error_mrad,
+            "Beam Director Rate Utilization": director_rate_utilization,
+            "Beam Director Rate Demand Ratio": director_rate_demand_ratio,
+            "Beam Director Rate Saturated": director_rate_saturated,
             "Spot Diameter (m)": beam["spot_diameter_m"],
             "Average Irradiance (kW/m^2)": average_irradiance_kw_m2,
             "Absorbed Heat Flux (kW/m^2)": absorbed_flux_kw_m2,
@@ -2552,7 +3233,10 @@ def simulate_time_stepped_engagement(
         rows[-1]
     )
 
-    return timeline, final_state
+    return (
+        timeline,
+        final_state,
+    )
 
 
 def perturb_scenario(
@@ -2636,6 +3320,27 @@ def perturb_scenario(
             ),
             0.0,
             180.0,
+        ),
+        initial_altitude_m=max(
+            0.0,
+            random.gauss(
+                tgt.initial_altitude_m,
+                max(
+                    25.0,
+                    0.03 * max(
+                        tgt.initial_altitude_m,
+                        1.0,
+                    ),
+                ),
+            ),
+        ),
+        flight_path_angle_deg=clamp(
+            random.gauss(
+                tgt.flight_path_angle_deg,
+                2.0,
+            ),
+            -60.0,
+            45.0,
         ),
         aspect_factor=clamp(
             random.gauss(
@@ -2919,7 +3624,6 @@ def build_3d_digital_twin_figure(
     tgt: Target,
     result: dict,
     selected_index: int,
-    display_altitude_m: float,
     camera_preset: str = "Isometric",
     show_target_path: bool = True,
     show_cpa: bool = True,
@@ -2932,8 +3636,9 @@ def build_3d_digital_twin_figure(
     """
     Interactive 3-D visualization layer for the authoritative engagement timeline.
 
-    The physics engine remains a solved 2-D engagement plane. This viewer embeds that
-    solution in 3-D for systems visualization and does not add unmodeled flight dynamics.
+    The viewer renders the authoritative true 3-D constant-velocity engagement state.
+    The same x/y/z trajectory drives slant range, tracking, pointing, propagation,
+    thermal calculations, event markers, and visualization.
     """
     if timeline is None or timeline.empty:
         return go.Figure()
@@ -2948,45 +3653,39 @@ def build_3d_digital_twin_figure(
         )
     )
 
-    radial_closing, transverse = target_velocity_components_mps(tgt)
-    r0_m = np.array(
-        [env.range_km * 1000.0, 0.0],
-        dtype=float,
-    )
-    velocity_mps = np.array(
-        [-radial_closing, transverse],
-        dtype=float,
-    )
-
     times_s = timeline["Time (s)"].to_numpy(dtype=float)
-    positions_m = np.array(
-        [r0_m + velocity_mps * t for t in times_s]
+
+    positions_m = np.column_stack(
+        [
+            timeline["X (km)"].to_numpy(dtype=float) * 1000.0,
+            timeline["Y (km)"].to_numpy(dtype=float) * 1000.0,
+            timeline["Z (km)"].to_numpy(dtype=float) * 1000.0,
+        ]
     )
 
     x_km = positions_m[:, 0] / 1000.0
     y_km = positions_m[:, 1] / 1000.0
-    z_km = np.full_like(
-        x_km,
-        display_altitude_m / 1000.0,
-        dtype=float,
-    )
+    z_km = positions_m[:, 2] / 1000.0
 
     t_sel = float(times_s[selected_index])
     p_sel = positions_m[selected_index]
+
     x_sel_km = float(p_sel[0] / 1000.0)
     y_sel_km = float(p_sel[1] / 1000.0)
-    z_sel_km = float(display_altitude_m / 1000.0)
+    z_sel_km = float(p_sel[2] / 1000.0)
 
     geometry = engagement_geometry(env, tgt)
     t_cpa = geometry["time_to_cpa_s"]
+    p_cpa = geometry["cpa_position_m"]
 
     if math.isfinite(t_cpa):
-        p_cpa = r0_m + velocity_mps * t_cpa
         cpa_x_km = float(p_cpa[0] / 1000.0)
         cpa_y_km = float(p_cpa[1] / 1000.0)
+        cpa_z_km = float(p_cpa[2] / 1000.0)
     else:
         cpa_x_km = float("nan")
         cpa_y_km = float("nan")
+        cpa_z_km = float("nan")
 
     theta = np.linspace(
         0.0,
@@ -3169,6 +3868,35 @@ def build_3d_digital_twin_figure(
 
     # Current target with rich telemetry.
     row = timeline.iloc[selected_index]
+
+    # Thermal-state halo: identity stays blue while the halo communicates
+    # Estimated Thermal Effect Index using green / orange / red.
+    fig.add_trace(
+        go.Scatter3d(
+            x=[x_sel_km],
+            y=[y_sel_km],
+            z=[z_sel_km],
+            mode="markers",
+            marker=dict(
+                size=18,
+                color="rgba(0,0,0,0)",
+                symbol="circle",
+                line=dict(
+                    color=target_color,
+                    width=5,
+                ),
+            ),
+            name="Target State",
+            hovertemplate=(
+                "<b>Target thermal state</b><br>"
+                f"Estimated thermal effect index: {effect_value:.1%}"
+                "<extra></extra>"
+            ),
+            showlegend=False,
+        )
+    )
+    target_halo_trace_index = len(fig.data) - 1
+
     fig.add_trace(
         go.Scatter3d(
             x=[x_sel_km],
@@ -3177,20 +3905,25 @@ def build_3d_digital_twin_figure(
             mode="markers+text",
             marker=dict(
                 size=10,
-                color=target_color,
+                color=CURRENT_TARGET_BLUE,
                 symbol="circle",
                 line=dict(
-                    color="#FFE0B2",
-                    width=1,
+                    color="#DCE7FF",
+                    width=1.5,
                 ),
             ),
-            text=[tgt.target_type],
+            text=["Current Target"],
             textposition="top center",
+            textfont=dict(
+                color=CURRENT_TARGET_BLUE,
+            ),
             name="Current Target",
             customdata=[[
                 t_sel,
                 float(row["Range (km)"]),
                 float(row["LOS Rate (mrad/s)"]),
+                float(row["Altitude (m)"]),
+                float(row["Elevation Angle (deg)"]),
                 float(row["Track Angular 1σ (mrad)"]),
                 float(row["Atmospheric Transmission"]),
                 float(row["Average Irradiance (kW/m^2)"]),
@@ -3204,13 +3937,15 @@ def build_3d_digital_twin_figure(
                 "Time: %{customdata[0]:.2f} s<br>"
                 "Range: %{customdata[1]:.2f} km<br>"
                 "LOS rate: %{customdata[2]:.3f} mrad/s<br>"
-                "Track 1σ: %{customdata[3]:.3f} mrad<br>"
-                "Atmospheric transmission: %{customdata[4]:.1%}<br>"
-                "Avg. irradiance: %{customdata[5]:.2f} kW/m²<br>"
-                "Target ΔT: %{customdata[6]:.1f} °C<br>"
-                "Thermal effect index: %{customdata[7]:.1%}<br>"
-                "Power availability: %{customdata[8]:.1%}<br>"
-                "Stored energy: %{customdata[9]:.2f} kWh"
+                "Altitude: %{customdata[3]:.0f} m<br>"
+                "Elevation: %{customdata[4]:.2f}°<br>"
+                "Track 1σ: %{customdata[5]:.3f} mrad<br>"
+                "Atmospheric transmission: %{customdata[6]:.1%}<br>"
+                "Avg. irradiance: %{customdata[7]:.2f} kW/m²<br>"
+                "Target ΔT: %{customdata[8]:.1f} °C<br>"
+                "Thermal effect index: %{customdata[9]:.1%}<br>"
+                "Power availability: %{customdata[10]:.1%}<br>"
+                "Stored energy: %{customdata[11]:.2f} kWh"
                 "<extra></extra>"
             ),
         )
@@ -3222,7 +3957,7 @@ def build_3d_digital_twin_figure(
             go.Scatter3d(
                 x=[cpa_x_km],
                 y=[cpa_y_km],
-                z=[z_sel_km],
+                z=[cpa_z_km],
                 mode="markers+text",
                 marker=dict(
                     size=7,
@@ -3239,23 +3974,22 @@ def build_3d_digital_twin_figure(
             )
         )
 
-    # Approximate radial/cross-range 1σ ellipse.
+    # 3-D 1σ transverse uncertainty ellipse in the plane normal to LOS.
     if show_uncertainty:
-        sigma_cross_m = float(
-            row["Track Cross-Range 1σ (m)"]
+        sigma_az_m = float(
+            row["Track Azimuth Cross-Range 1σ (m)"]
         )
-        sigma_radial_m = float(
-            row["Track Radial 1σ (m)"]
+        sigma_el_m = float(
+            row["Track Elevation Cross-Range 1σ (m)"]
         )
 
-        target_xy_m = p_sel
-        range_xy_m = max(
-            float(np.linalg.norm(target_xy_m)),
-            1.0,
-        )
-        u_r = target_xy_m / range_xy_m
-        u_t = np.array(
-            [-u_r[1], u_r[0]]
+        (
+            _u_r,
+            u_az,
+            u_el,
+            _range_m,
+        ) = los_basis_from_position(
+            p_sel
         )
 
         phi = np.linspace(
@@ -3263,23 +3997,25 @@ def build_3d_digital_twin_figure(
             2.0 * math.pi,
             121,
         )
-        ellipse_xy_m = np.array(
+
+        ellipse_points_m = np.array(
             [
-                target_xy_m
-                + sigma_radial_m * math.cos(a) * u_r
-                + sigma_cross_m * math.sin(a) * u_t
+                p_sel
+                + sigma_az_m
+                * math.cos(a)
+                * u_az
+                + sigma_el_m
+                * math.sin(a)
+                * u_el
                 for a in phi
             ]
         )
 
         fig.add_trace(
             go.Scatter3d(
-                x=ellipse_xy_m[:, 0] / 1000.0,
-                y=ellipse_xy_m[:, 1] / 1000.0,
-                z=np.full(
-                    len(phi),
-                    z_sel_km,
-                ),
+                x=ellipse_points_m[:, 0] / 1000.0,
+                y=ellipse_points_m[:, 1] / 1000.0,
+                z=ellipse_points_m[:, 2] / 1000.0,
                 mode="lines",
                 line=dict(
                     color="#FFB15A",
@@ -3406,7 +4142,15 @@ def build_3d_digital_twin_figure(
             (
                 "TRACK VALID",
                 timeline["Track Quality"].to_numpy(dtype=float) >= 0.60,
-                "#D9FF66",
+                "#FFF200",  # bright yellow event marker / label
+            ),
+            (
+                "ENGAGE",
+                timeline["Recommendation"].astype(str).str.contains(
+                    "ENGAGE / CONTINUE",
+                    regex=False,
+                ).to_numpy(),
+                HUD_RED,
             ),
             (
                 "EFFECT INDEX 50%",
@@ -3425,7 +4169,7 @@ def build_3d_digital_twin_figure(
                 go.Scatter3d(
                     x=[p_evt[0] / 1000.0],
                     y=[p_evt[1] / 1000.0],
-                    z=[display_altitude_m / 1000.0],
+                    z=[p_evt[2] / 1000.0],
                     mode="markers+text",
                     marker=dict(
                         size=6,
@@ -3471,7 +4215,7 @@ def build_3d_digital_twin_figure(
             p = positions_m[idx]
             px = float(p[0] / 1000.0)
             py = float(p[1] / 1000.0)
-            pz = float(display_altitude_m / 1000.0)
+            pz = float(p[2] / 1000.0)
             r = timeline.iloc[idx]
             eff = float(
                 r["Estimated Thermal Effect Index"]
@@ -3488,6 +4232,7 @@ def build_3d_digital_twin_figure(
                     name=f"{idx}",
                     traces=[
                         beam_trace_index,
+                        target_halo_trace_index,
                         target_trace_index,
                     ],
                     data=[
@@ -3515,22 +4260,43 @@ def build_3d_digital_twin_figure(
                             x=[px],
                             y=[py],
                             z=[pz],
+                            mode="markers",
+                            marker=dict(
+                                size=18,
+                                color="rgba(0,0,0,0)",
+                                symbol="circle",
+                                line=dict(
+                                    color=frame_color,
+                                    width=5,
+                                ),
+                            ),
+                            showlegend=False,
+                        ),
+                        go.Scatter3d(
+                            x=[px],
+                            y=[py],
+                            z=[pz],
                             mode="markers+text",
                             marker=dict(
                                 size=10,
-                                color=frame_color,
+                                color=CURRENT_TARGET_BLUE,
                                 symbol="circle",
                                 line=dict(
-                                    color="#FFE0B2",
-                                    width=1,
+                                    color="#DCE7FF",
+                                    width=1.5,
                                 ),
                             ),
-                            text=[tgt.target_type],
+                            text=["Current Target"],
                             textposition="top center",
+                            textfont=dict(
+                                color=CURRENT_TARGET_BLUE,
+                            ),
                             customdata=[[
                                 float(r["Time (s)"]),
                                 float(r["Range (km)"]),
                                 float(r["LOS Rate (mrad/s)"]),
+                                float(r["Altitude (m)"]),
+                                float(r["Elevation Angle (deg)"]),
                                 float(r["Track Angular 1σ (mrad)"]),
                                 float(r["Atmospheric Transmission"]),
                                 float(r["Average Irradiance (kW/m^2)"]),
@@ -3544,13 +4310,15 @@ def build_3d_digital_twin_figure(
                                 "Time: %{customdata[0]:.2f} s<br>"
                                 "Range: %{customdata[1]:.2f} km<br>"
                                 "LOS rate: %{customdata[2]:.3f} mrad/s<br>"
-                                "Track 1σ: %{customdata[3]:.3f} mrad<br>"
-                                "Atmospheric transmission: %{customdata[4]:.1%}<br>"
-                                "Avg. irradiance: %{customdata[5]:.2f} kW/m²<br>"
-                                "Target ΔT: %{customdata[6]:.1f} °C<br>"
-                                "Thermal effect index: %{customdata[7]:.1%}<br>"
-                                "Power availability: %{customdata[8]:.1%}<br>"
-                                "Stored energy: %{customdata[9]:.2f} kWh"
+                                "Altitude: %{customdata[3]:.0f} m<br>"
+                                "Elevation: %{customdata[4]:.2f}°<br>"
+                                "Track 1σ: %{customdata[5]:.3f} mrad<br>"
+                                "Atmospheric transmission: %{customdata[6]:.1%}<br>"
+                                "Avg. irradiance: %{customdata[7]:.2f} kW/m²<br>"
+                                "Target ΔT: %{customdata[8]:.1f} °C<br>"
+                                "Thermal effect index: %{customdata[9]:.1%}<br>"
+                                "Power availability: %{customdata[10]:.1%}<br>"
+                                "Stored energy: %{customdata[11]:.2f} kWh"
                                 "<extra></extra>"
                             ),
                         ),
@@ -3693,7 +4461,7 @@ def build_3d_digital_twin_figure(
                 backgroundcolor=HUD_BG,
             ),
             zaxis=dict(
-                title="Display Altitude (km)",
+                title="Z / Altitude (km)",
                 color=HUD_TEXT,
                 gridcolor="#3A2814",
                 zerolinecolor=HUD_ORANGE_DIM,
@@ -3763,7 +4531,7 @@ with st.sidebar:
 
     st.subheader("Environment")
     range_km = st.slider(
-        "Target range (km)",
+        "Initial horizontal range (km)",
         0.5,
         25.0,
         6.0,
@@ -3837,118 +4605,67 @@ with st.sidebar:
 
     TARGET_PRESETS = {
         "Small Multirotor UAS": {
-            "speed": 30.0,
-            "angle": 30.0,
-            "aspect": 0.55,
-            "maneuver": 0.75,
-            "radius": 0.20,
-            "absorptivity": 0.60,
-            "areal_heat_capacity": 2.5,
-            "thermal_loss": 0.010,
-            "failure_delta_t": 140.0,
-            "hardness": 0.8,
+            "speed": 30.0, "angle": 30.0, "altitude": 150.0, "flight_path": -2.0,
+            "aspect": 0.55, "maneuver": 0.75, "radius": 0.20,
+            "absorptivity": 0.60, "areal_heat_capacity": 2.5,
+            "thermal_loss": 0.010, "failure_delta_t": 140.0, "hardness": 0.8,
         },
         "Fixed-Wing UAS": {
-            "speed": 55.0,
-            "angle": 25.0,
-            "aspect": 0.68,
-            "maneuver": 0.50,
-            "radius": 0.30,
-            "absorptivity": 0.55,
-            "areal_heat_capacity": 3.5,
-            "thermal_loss": 0.012,
-            "failure_delta_t": 165.0,
-            "hardness": 0.9,
+            "speed": 55.0, "angle": 25.0, "altitude": 800.0, "flight_path": -3.0,
+            "aspect": 0.68, "maneuver": 0.50, "radius": 0.30,
+            "absorptivity": 0.55, "areal_heat_capacity": 3.5,
+            "thermal_loss": 0.012, "failure_delta_t": 165.0, "hardness": 0.9,
         },
         "Large UAS": {
-            "speed": 85.0,
-            "angle": 15.0,
-            "aspect": 0.80,
-            "maneuver": 0.30,
-            "radius": 0.60,
-            "absorptivity": 0.50,
-            "areal_heat_capacity": 5.0,
-            "thermal_loss": 0.015,
-            "failure_delta_t": 190.0,
-            "hardness": 1.1,
+            "speed": 85.0, "angle": 15.0, "altitude": 2000.0, "flight_path": -2.0,
+            "aspect": 0.80, "maneuver": 0.30, "radius": 0.60,
+            "absorptivity": 0.50, "areal_heat_capacity": 5.0,
+            "thermal_loss": 0.015, "failure_delta_t": 190.0, "hardness": 1.1,
         },
         "Loitering Munition": {
-            "speed": 70.0,
-            "angle": 15.0,
-            "aspect": 0.72,
-            "maneuver": 0.55,
-            "radius": 0.22,
-            "absorptivity": 0.52,
-            "areal_heat_capacity": 3.8,
-            "thermal_loss": 0.014,
-            "failure_delta_t": 175.0,
-            "hardness": 1.0,
+            "speed": 70.0, "angle": 15.0, "altitude": 1000.0, "flight_path": -8.0,
+            "aspect": 0.72, "maneuver": 0.55, "radius": 0.22,
+            "absorptivity": 0.52, "areal_heat_capacity": 3.8,
+            "thermal_loss": 0.014, "failure_delta_t": 175.0, "hardness": 1.0,
         },
         "Cruise-Missile-Like Target": {
-            "speed": 250.0,
-            "angle": 8.0,
-            "aspect": 0.82,
-            "maneuver": 0.28,
-            "radius": 0.25,
-            "absorptivity": 0.47,
-            "areal_heat_capacity": 5.5,
-            "thermal_loss": 0.018,
-            "failure_delta_t": 215.0,
-            "hardness": 1.25,
+            "speed": 250.0, "angle": 8.0, "altitude": 300.0, "flight_path": -1.0,
+            "aspect": 0.82, "maneuver": 0.28, "radius": 0.25,
+            "absorptivity": 0.47, "areal_heat_capacity": 5.5,
+            "thermal_loss": 0.018, "failure_delta_t": 215.0, "hardness": 1.25,
         },
         "Rocket / Artillery-Like Target": {
-            "speed": 330.0,
-            "angle": 5.0,
-            "aspect": 0.85,
-            "maneuver": 0.12,
-            "radius": 0.18,
-            "absorptivity": 0.44,
-            "areal_heat_capacity": 6.2,
-            "thermal_loss": 0.020,
-            "failure_delta_t": 225.0,
-            "hardness": 1.35,
+            "speed": 330.0, "angle": 5.0, "altitude": 3000.0, "flight_path": -25.0,
+            "aspect": 0.85, "maneuver": 0.12, "radius": 0.18,
+            "absorptivity": 0.44, "areal_heat_capacity": 6.2,
+            "thermal_loss": 0.020, "failure_delta_t": 225.0, "hardness": 1.35,
         },
         "Helicopter-Like Target": {
-            "speed": 70.0,
-            "angle": 45.0,
-            "aspect": 0.88,
-            "maneuver": 0.45,
-            "radius": 0.85,
-            "absorptivity": 0.48,
-            "areal_heat_capacity": 7.0,
-            "thermal_loss": 0.020,
-            "failure_delta_t": 210.0,
-            "hardness": 1.25,
+            "speed": 70.0, "angle": 45.0, "altitude": 600.0, "flight_path": 0.0,
+            "aspect": 0.88, "maneuver": 0.45, "radius": 0.85,
+            "absorptivity": 0.48, "areal_heat_capacity": 7.0,
+            "thermal_loss": 0.020, "failure_delta_t": 210.0, "hardness": 1.25,
         },
         "Fixed-Wing Aircraft": {
-            "speed": 220.0,
-            "angle": 40.0,
-            "aspect": 0.90,
-            "maneuver": 0.35,
-            "radius": 1.10,
-            "absorptivity": 0.46,
-            "areal_heat_capacity": 8.0,
-            "thermal_loss": 0.022,
-            "failure_delta_t": 230.0,
-            "hardness": 1.35,
+            "speed": 220.0, "angle": 40.0, "altitude": 3500.0, "flight_path": -3.0,
+            "aspect": 0.90, "maneuver": 0.35, "radius": 1.10,
+            "absorptivity": 0.46, "areal_heat_capacity": 8.0,
+            "thermal_loss": 0.022, "failure_delta_t": 230.0, "hardness": 1.35,
         },
         "Generic Airborne Target": {
-            "speed": 120.0,
-            "angle": 45.0,
-            "aspect": 0.75,
-            "maneuver": 0.35,
-            "radius": 0.40,
-            "absorptivity": 0.50,
-            "areal_heat_capacity": 4.0,
-            "thermal_loss": 0.012,
-            "failure_delta_t": 180.0,
-            "hardness": 1.0,
+            "speed": 120.0, "angle": 45.0, "altitude": 1500.0, "flight_path": -5.0,
+            "aspect": 0.75, "maneuver": 0.35, "radius": 0.40,
+            "absorptivity": 0.50, "areal_heat_capacity": 4.0,
+            "thermal_loss": 0.012, "failure_delta_t": 180.0, "hardness": 1.0,
         },
     }
 
     target_type = st.selectbox(
         "Target type",
         list(TARGET_PRESETS.keys()),
+    )
+    st.caption(
+        "Target presets are generic demonstration parameters, not authoritative threat specifications."
     )
     preset = TARGET_PRESETS[target_type]
 
@@ -3957,6 +4674,8 @@ with st.sidebar:
     ) != target_type:
         st.session_state.target_speed_v4 = preset["speed"]
         st.session_state.target_angle_v4 = preset["angle"]
+        st.session_state.target_altitude_v4 = preset["altitude"]
+        st.session_state.target_flight_path_v4 = preset["flight_path"]
         st.session_state.target_aspect_v4 = preset["aspect"]
         st.session_state.target_maneuver_v4 = preset["maneuver"]
         st.session_state.target_radius_v4 = preset["radius"]
@@ -3975,12 +4694,31 @@ with st.sidebar:
         step=5.0,
     )
     velocity_angle_deg = st.slider(
-        "Velocity angle relative to LOS (deg)",
+        "Horizontal velocity angle relative to LOS (deg)",
         0.0,
         180.0,
         key="target_angle_v4",
         step=5.0,
-        help="0° = direct closing, 90° = crossing, 180° = receding.",
+        help="0° = horizontally closing, 90° = crossing, 180° = receding.",
+    )
+    initial_altitude_m = st.slider(
+        "Initial target altitude (m)",
+        0.0,
+        10000.0,
+        key="target_altitude_v4",
+        step=100.0,
+        help="Physical z-coordinate used by the authoritative 3-D engagement model.",
+    )
+    flight_path_angle_deg = st.slider(
+        "Flight-path angle (deg)",
+        -60.0,
+        45.0,
+        key="target_flight_path_v4",
+        step=1.0,
+        help=(
+            "Negative = descending, 0° = level, positive = climbing. "
+            "Descending trajectories terminate at the z=0 reference plane."
+        ),
     )
     aspect_factor = st.slider(
         "Aspect / observability factor",
@@ -3990,7 +4728,7 @@ with st.sidebar:
         step=0.05,
     )
     maneuver_factor = st.slider(
-        "Maneuver index",
+        "Maneuver / acceleration uncertainty index",
         0.0,
         1.0,
         key="target_maneuver_v4",
@@ -4250,16 +4988,9 @@ with st.sidebar:
 
 
     st.subheader("3D Digital Twin View")
-    display_altitude_m = st.slider(
-        "Display altitude (m)",
-        0.0,
-        5000.0,
-        1000.0,
-        100.0,
-        help=(
-            "Visualization-only altitude. The current engagement physics remains "
-            "a 2-D solved plane embedded in the 3-D viewer."
-        ),
+    st.caption(
+        "Altitude is now part of the authoritative 3-D target state and directly "
+        "affects slant range, LOS geometry, tracking, beam pointing, and propagation."
     )
 
 
@@ -4279,6 +5010,8 @@ tgt = Target(
     target_type,
     speed_mps,
     velocity_angle_deg,
+    initial_altitude_m,
+    flight_path_angle_deg,
     aspect_factor,
     maneuver_factor,
     characteristic_radius_m,
@@ -4471,6 +5204,7 @@ with tab1:
             "Optical depth",
             "Available engagement time",
             "Time to CPA",
+            "Time to ground impact",
             "CPA range",
             "Effective dwell time",
             "Requested electrical input",
@@ -4502,6 +5236,11 @@ with tab1:
             f"{result['Optical Depth']:.3f}",
             f"{result['Available Engagement Time (s)']:.2f} s",
             f"{result['Time to CPA (s)']:.2f} s",
+            (
+                f"{result['Time to Ground Impact (s)']:.2f} s"
+                if math.isfinite(result["Time to Ground Impact (s)"])
+                else "N/A"
+            ),
             f"{result['CPA Range (m)']:.1f} m",
             f"{result['Effective Dwell Time (s)']:.2f} s",
             f"{result['Requested Electrical Input (kW)']:.1f} kW",
@@ -4570,10 +5309,13 @@ with tab2:
             "Track update rate",
             "Data latency",
             "LOS angular rate",
+            "Azimuth LOS rate",
+            "Elevation LOS rate",
+            "Elevation angle",
             "Measurement availability",
             "Beam-director rate utilization",
-            "Servo pointing 1σ",
-            "Combined pointing 1σ",
+            "Servo tracking error",
+            "Effective pointing error",
         ],
         "Value": [
             f"{sensors.range_measurement_sigma_m:.2f} m",
@@ -4582,10 +5324,13 @@ with tab2:
             f"{sensors.track_update_hz:.1f} Hz",
             f"{sensors.data_latency_ms:.0f} ms",
             f"{result['LOS Rate (mrad/s)']:.3f} mrad/s",
+            f"{result['Azimuth LOS Rate (mrad/s)']:.3f} mrad/s",
+            f"{result['Elevation LOS Rate (mrad/s)']:.3f} mrad/s",
+            f"{result['Elevation Angle (deg)']:.2f}°",
             f"{result['Measurement Availability']:.1%}",
             f"{result['Beam Director Rate Utilization']:.1%}",
-            f"{result['Servo Pointing 1σ (mrad)']:.3f} mrad",
-            f"{result['Combined Pointing 1σ (mrad)']:.3f} mrad",
+            f"{result['Servo Tracking Error (mrad)']:.3f} mrad",
+            f"{result['Effective Pointing Error (mrad)']:.3f} mrad",
         ],
     })
 
@@ -4792,9 +5537,10 @@ with tab6:
     st.markdown("### Interactive 3D Digital Twin")
 
     st.caption(
-        "This view embeds the authoritative 2-D engagement solution in a 3-D systems "
-        "visualization. Display altitude and camera orientation are visualization-only "
-        "and do not alter the underlying engagement physics."
+        "This view renders the authoritative true 3-D constant-velocity engagement "
+        "solution. The target z-coordinate is physically modeled and participates in "
+        "slant range, CPA, LOS azimuth/elevation, tracking covariance, beam pointing, "
+        "atmospheric path length, irradiance, and thermal calculations."
     )
 
     if timeline is not None and not timeline.empty:
@@ -4861,20 +5607,20 @@ with tab6:
             f"{row_3d['Time (s)']:.2f} s",
         )
         d2.metric(
-            "Range",
+            "Slant Range",
             f"{row_3d['Range (km)']:.2f} km",
         )
         d3.metric(
-            "LOS Rate",
-            f"{row_3d['LOS Rate (mrad/s)']:.3f} mrad/s",
+            "Altitude",
+            f"{row_3d['Altitude (m)']:.0f} m",
         )
         d4.metric(
-            "Track 1σ",
-            f"{row_3d['Track Angular 1σ (mrad)']:.3f} mrad",
+            "Elevation",
+            f"{row_3d['Elevation Angle (deg)']:.2f}°",
         )
         d5.metric(
-            "Spot Diameter",
-            f"{row_3d['Spot Diameter (m)']:.2f} m",
+            "LOS Rate",
+            f"{row_3d['LOS Rate (mrad/s)']:.3f} mrad/s",
         )
         d6.metric(
             "Thermal Effect",
@@ -4887,7 +5633,6 @@ with tab6:
             tgt,
             result,
             selected_step,
-            display_altitude_m,
             camera_preset=camera_preset,
             show_target_path=show_target_path,
             show_cpa=show_cpa,
@@ -4927,10 +5672,11 @@ with tab6:
         )
 
         st.caption(
-            "3D symbology: orange = target path, bright green = beam/LOS, "
-            "orange dotted ellipse = approximate 1σ track uncertainty, green ring = "
-            "effective beam footprint, white X = CPA. Target color changes from green "
-            "to fire orange to red as the estimated thermal effect index increases."
+            "3D symbology: blue = Current Target identity; the surrounding target-state "
+            "halo changes green → fire orange → red as the Estimated Thermal Effect Index "
+            "increases. DETECT is green, TRACK VALID is bright yellow, ENGAGE is bright red, "
+            "orange = target path, bright green = beam/LOS, orange dotted ellipse = approximate "
+            "1σ track uncertainty, green ring = effective beam footprint, and white X = CPA."
         )
     else:
         st.info(
@@ -4945,10 +5691,12 @@ st.caption(
     "engineering framework. Atmospheric extinction uses a Beer-Lambert model with "
     "visibility-derived aerosol extinction, Rayleigh scaling, and a generic humidity "
     "term. Tracking uses sequential constant-velocity Kalman covariance propagation, "
-    "and instantaneous LOS rate is computed directly from the evolving 2-D geometry. "
-    "Target response uses a lumped areal thermal model. The 3-D view is a visualization "
-    "layer that embeds the solved 2-D engagement plane without adding unmodeled 3-D "
-    "flight dynamics. None of these models constitute validated "
+    "and azimuth/elevation LOS rates are computed directly from the evolving 3-D geometry. "
+    "Target response uses a lumped areal thermal model. The 3-D view renders the same "
+    "modeled x/y/z constant-velocity target state used by the engagement physics, including "
+    "slant range, CPA, LOS geometry, covariance projection, and beam pointing. The model "
+    "does not include full aerodynamic flight dynamics or target-specific guidance laws. "
+    "None of these models constitute validated "
     "operational weapon-performance, lethality, or probability-of-kill predictions. "
     "The current target preset library spans multiple generic airborne target classes, "
     "and the target-speed envelope remains intentionally limited to 350 m/s."
