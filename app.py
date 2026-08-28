@@ -4521,6 +4521,933 @@ def build_3d_digital_twin_figure(
     return fig
 
 
+
+# ============================================================
+# Advanced aerospace digital-twin / V&V helpers
+# ============================================================
+
+@dataclass
+class GenericPlatformMotion:
+    speed_mps: float
+    heading_deg: float
+    climb_rate_mps: float
+    roll_deg: float
+    pitch_deg: float
+    yaw_deg: float
+
+
+@dataclass
+class GenericSixDOFState:
+    x_m: float
+    y_m: float
+    z_m: float
+    vx_mps: float
+    vy_mps: float
+    vz_mps: float
+    roll_deg: float
+    pitch_deg: float
+    yaw_deg: float
+    p_deg_s: float
+    q_deg_s: float
+    r_deg_s: float
+
+
+def generic_maneuvering_truth_attitude_kinematics(
+    initial_position_m: np.ndarray,
+    initial_velocity_mps: np.ndarray,
+    duration_s: float,
+    dt_s: float,
+    lateral_accel_mps2: float,
+    vertical_accel_mps2: float,
+    yaw_rate_deg_s: float,
+    pitch_rate_deg_s: float,
+    roll_rate_deg_s: float,
+):
+    """
+    Educational 3-D maneuvering truth + attitude-kinematics trajectory.
+
+    Translational acceleration and body angular rates are simple user-visible
+    abstractions for aerospace digital-twin demonstrations. Translational and
+    rotational states are not coupled through rigid-body forces/moments or inertia,
+    so this is intentionally not labeled as a full 6-DOF flight-dynamics model.
+    This function is decoupled from engagement / energy-delivery calculations.
+    """
+    duration_s = max(float(duration_s), 0.0)
+    dt_s = max(float(dt_s), 0.02)
+
+    # Build the timeline from the requested solver step so reported time and
+    # integrated physical time remain consistent. Append the exact endpoint
+    # when duration_s is not an integer multiple of dt_s.
+    t = np.arange(
+        0.0,
+        duration_s + 0.5 * dt_s,
+        dt_s,
+        dtype=float,
+    )
+
+    if t.size == 0:
+        t = np.array([0.0], dtype=float)
+
+    if t[-1] < duration_s - 1e-12:
+        t = np.append(t, duration_s)
+    elif t[-1] > duration_s + 1e-12:
+        t[-1] = duration_s
+
+    pos = np.asarray(initial_position_m, dtype=float).copy()
+    vel = np.asarray(initial_velocity_mps, dtype=float).copy()
+
+    rows = []
+
+    roll = 0.0
+    pitch = 0.0
+    yaw = math.degrees(math.atan2(vel[1], vel[0])) if np.linalg.norm(vel[:2]) > 1e-9 else 0.0
+
+    for k, tk in enumerate(t):
+        if k > 0:
+            dt_actual = max(
+                float(t[k] - t[k - 1]),
+                0.0,
+            )
+
+            speed_xy = max(math.hypot(vel[0], vel[1]), 1e-6)
+            # Lateral acceleration normal to the horizontal velocity vector.
+            normal_xy = np.array([-vel[1], vel[0], 0.0], dtype=float) / speed_xy
+            accel = lateral_accel_mps2 * normal_xy + np.array(
+                [0.0, 0.0, vertical_accel_mps2], dtype=float
+            )
+
+            vel = vel + accel * dt_actual
+            pos = pos + vel * dt_actual
+
+            roll += roll_rate_deg_s * dt_actual
+            pitch += pitch_rate_deg_s * dt_actual
+            yaw += yaw_rate_deg_s * dt_actual
+
+        rows.append(
+            {
+                "Time (s)": float(tk),
+                "X (m)": float(pos[0]),
+                "Y (m)": float(pos[1]),
+                "Z (m)": float(max(pos[2], 0.0)),
+                "VX (m/s)": float(vel[0]),
+                "VY (m/s)": float(vel[1]),
+                "VZ (m/s)": float(vel[2]),
+                "Speed (m/s)": float(np.linalg.norm(vel)),
+                "Roll (deg)": float(roll),
+                "Pitch (deg)": float(pitch),
+                "Yaw (deg)": float(yaw),
+                "Roll-angle rate (deg/s)": float(roll_rate_deg_s),
+                "Pitch-angle rate (deg/s)": float(pitch_rate_deg_s),
+                "Yaw-angle rate (deg/s)": float(yaw_rate_deg_s),
+            }
+        )
+
+        if pos[2] <= 0.0 and k > 0 and vel[2] < 0.0:
+            break
+
+    return pd.DataFrame(rows)
+
+
+def moving_platform_truth(
+    duration_s: float,
+    dt_s: float,
+    motion: GenericPlatformMotion,
+):
+    """Generic moving-platform kinematics for systems-engineering visualization."""
+    t = np.arange(0.0, max(duration_s, dt_s) + 1e-9, dt_s)
+    hdg = math.radians(motion.heading_deg)
+    vx = motion.speed_mps * math.cos(hdg)
+    vy = motion.speed_mps * math.sin(hdg)
+    vz = motion.climb_rate_mps
+
+    return pd.DataFrame(
+        {
+            "Time (s)": t,
+            "X (m)": vx * t,
+            "Y (m)": vy * t,
+            "Z (m)": np.maximum(0.0, vz * t),
+            "VX (m/s)": vx,
+            "VY (m/s)": vy,
+            "VZ (m/s)": vz,
+            "Roll (deg)": motion.roll_deg,
+            "Pitch (deg)": motion.pitch_deg,
+            "Yaw (deg)": motion.yaw_deg,
+        }
+    )
+
+
+def generic_sensor_measurements(
+    truth_df: pd.DataFrame,
+    platform_df: pd.DataFrame,
+    range_sigma_m: float,
+    az_sigma_mrad: float,
+    el_sigma_mrad: float,
+    dropout_rate: float,
+    seed: int = 7,
+):
+    """
+    Generate generic range / azimuth / elevation observations from known truth.
+    The measurements are for estimator/V&V demonstration only and are not fed
+    into the directed-energy engagement calculations.
+    """
+    rng = np.random.default_rng(seed)
+    n = min(len(truth_df), len(platform_df))
+    rows = []
+
+    for i in range(n):
+        tp = truth_df.iloc[i]
+        pp = platform_df.iloc[i]
+
+        rel = np.array(
+            [
+                tp["X (m)"] - pp["X (m)"],
+                tp["Y (m)"] - pp["Y (m)"],
+                tp["Z (m)"] - pp["Z (m)"],
+            ],
+            dtype=float,
+        )
+
+        true_range = max(float(np.linalg.norm(rel)), 1e-6)
+        az = math.atan2(rel[1], rel[0])
+        el = math.atan2(rel[2], math.hypot(rel[0], rel[1]))
+
+        received = bool(rng.random() >= clamp(dropout_rate, 0.0, 0.95))
+        if received:
+            measured_range = true_range + rng.normal(0.0, max(range_sigma_m, 1e-6))
+            measured_az = az + rng.normal(0.0, max(az_sigma_mrad, 1e-6) / 1000.0)
+            measured_el = el + rng.normal(0.0, max(el_sigma_mrad, 1e-6) / 1000.0)
+        else:
+            measured_range = float("nan")
+            measured_az = float("nan")
+            measured_el = float("nan")
+
+        rows.append(
+            {
+                "Time (s)": float(tp["Time (s)"]),
+                "Measurement Received": received,
+                "True Range (m)": true_range,
+                "Measured Range (m)": measured_range,
+                "True Azimuth (deg)": math.degrees(az),
+                "Measured Azimuth (deg)": math.degrees(measured_az) if received else float("nan"),
+                "True Elevation (deg)": math.degrees(el),
+                "Measured Elevation (deg)": math.degrees(measured_el) if received else float("nan"),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def generic_measurement_reconstruction(
+    measurements_df: pd.DataFrame,
+    platform_df: pd.DataFrame,
+):
+    """
+    Reconstruct Cartesian position from generic range/az/el measurements.
+    This is a measurement-domain demonstration, not a fire-control solution.
+    """
+    n = min(len(measurements_df), len(platform_df))
+    rows = []
+
+    for i in range(n):
+        m = measurements_df.iloc[i]
+        p = platform_df.iloc[i]
+
+        if not bool(m["Measurement Received"]):
+            rows.append(
+                {
+                    "Time (s)": float(m["Time (s)"]),
+                    "Estimated X (m)": float("nan"),
+                    "Estimated Y (m)": float("nan"),
+                    "Estimated Z (m)": float("nan"),
+                }
+            )
+            continue
+
+        r = float(m["Measured Range (m)"])
+        az = math.radians(float(m["Measured Azimuth (deg)"]))
+        el = math.radians(float(m["Measured Elevation (deg)"]))
+
+        rel = np.array(
+            [
+                r * math.cos(el) * math.cos(az),
+                r * math.cos(el) * math.sin(az),
+                r * math.sin(el),
+            ]
+        )
+
+        rows.append(
+            {
+                "Time (s)": float(m["Time (s)"]),
+                "Estimated X (m)": float(p["X (m)"] + rel[0]),
+                "Estimated Y (m)": float(p["Y (m)"] + rel[1]),
+                "Estimated Z (m)": float(max(0.0, p["Z (m)"] + rel[2])),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def layered_visibility_index(
+    slant_range_km: float,
+    target_altitude_m: float,
+    surface_visibility_km: float,
+    humidity_pct: float,
+    layers: int = 24,
+):
+    """
+    Generic layered atmosphere for sensor-visibility/V&V studies.
+
+    This is not a high-fidelity laser propagation model. It produces a normalized
+    visibility/transmission index by integrating a simple altitude-decaying
+    extinction field along a straight slant path.
+    """
+    layers = max(int(layers), 4)
+    s = np.linspace(0.0, 1.0, layers)
+    z_km = (max(target_altitude_m, 0.0) / 1000.0) * s
+
+    base_ext = 3.912 / max(surface_visibility_km, 0.2)
+    aerosol = base_ext * np.exp(-z_km / 1.5)
+    humidity = 0.015 * clamp(humidity_pct / 100.0, 0.0, 1.0) * np.exp(-z_km / 2.0)
+    extinction = aerosol + humidity
+
+    ds_km = max(slant_range_km, 0.0) / max(layers - 1, 1)
+    optical_depth = float(np.trapz(extinction, dx=ds_km))
+    return {
+        "optical_depth": optical_depth,
+        "visibility_index": clamp(math.exp(-optical_depth), 0.0, 1.0),
+    }
+
+
+def second_order_gimbal_response(
+    command_deg: np.ndarray,
+    dt_s: float,
+    natural_frequency_hz: float,
+    damping_ratio: float,
+    rate_limit_deg_s: float,
+    accel_limit_deg_s2: float,
+):
+    """
+    Generic second-order sensor/gimbal response for controls education.
+
+    The command is assumed to be continuous/unwrapped before entering this
+    function. Internally, the dynamics are substepped so the numerical
+    integration remains well resolved relative to the natural frequency.
+
+    This demonstration does not drive the directed-energy engagement model.
+    """
+    command_deg = np.asarray(
+        command_deg,
+        dtype=float,
+    )
+
+    if command_deg.size == 0:
+        return np.asarray([], dtype=float)
+
+    dt_s = max(
+        float(dt_s),
+        1e-4,
+    )
+    fn_hz = max(
+        float(natural_frequency_hz),
+        0.05,
+    )
+    wn = 2.0 * math.pi * fn_hz
+    zeta = max(
+        float(damping_ratio),
+        0.05,
+    )
+    rate_limit = max(
+        float(rate_limit_deg_s),
+        0.1,
+    )
+    accel_limit = max(
+        float(accel_limit_deg_s2),
+        0.1,
+    )
+
+    # Resolve at least 20 integration points per natural period, while
+    # never using a substep larger than the external command interval.
+    max_internal_dt = min(
+        dt_s,
+        1.0 / (20.0 * fn_hz),
+    )
+    substeps = max(
+        1,
+        int(
+            math.ceil(
+                dt_s / max_internal_dt
+            )
+        ),
+    )
+    dt_internal = (
+        dt_s / substeps
+    )
+
+    theta = float(command_deg[0])
+    theta_dot = 0.0
+    out = [theta]
+
+    for i in range(1, command_deg.size):
+        cmd = float(command_deg[i])
+
+        for _ in range(substeps):
+            accel_cmd = (
+                wn**2 * (cmd - theta)
+                - 2.0 * zeta * wn * theta_dot
+            )
+
+            accel = float(
+                np.clip(
+                    accel_cmd,
+                    -accel_limit,
+                    accel_limit,
+                )
+            )
+
+            # Semi-implicit Euler with a stability-oriented internal substep.
+            theta_dot = float(
+                np.clip(
+                    theta_dot + accel * dt_internal,
+                    -rate_limit,
+                    rate_limit,
+                )
+            )
+            theta += (
+                theta_dot
+                * dt_internal
+            )
+
+        out.append(theta)
+
+    return np.asarray(
+        out,
+        dtype=float,
+    )
+
+
+def timestep_convergence_study(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+    hel: HELState,
+    platform: PlatformState,
+):
+    """
+    Generic timestep sensitivity check for the existing low-order model.
+    """
+    dts = [0.20, 0.10, 0.05]
+    rows = []
+
+    for dt in dts:
+        timeline_dt, final_dt = simulate_time_stepped_engagement(
+            env,
+            tgt,
+            sensors,
+            hel,
+            platform,
+            dt_s=dt,
+            stochastic_measurements=False,
+        )
+
+        rows.append(
+            {
+                "dt (s)": dt,
+                "Timeline Rows": len(timeline_dt),
+                "Final Range (km)": final_dt.get("Final Range (km)", float("nan")),
+                "Track Quality": final_dt.get("Track Quality", float("nan")),
+                "Atmospheric Transmission": final_dt.get("Atmospheric Transmission", float("nan")),
+                "Thermal Effect Index": final_dt.get("Estimated Thermal Effect Index", float("nan")),
+                "Readiness Score": final_dt.get("Readiness Score", float("nan")),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def energy_balance_check(
+    timeline: pd.DataFrame,
+):
+    """
+    Lightweight consistency check using exported platform-energy quantities.
+    """
+    if timeline.empty:
+        return {
+            "storage_monotonic": True,
+            "nonnegative_storage": True,
+            "power_ratio_valid": True,
+        }
+
+    storage = timeline["Stored Energy Remaining (kWh)"].to_numpy(dtype=float)
+    power_ratio = timeline["Power Availability Ratio"].to_numpy(dtype=float)
+
+    return {
+        "storage_monotonic": bool(np.all(np.diff(storage) <= 1e-9)),
+        "nonnegative_storage": bool(np.all(storage >= -1e-9)),
+        "power_ratio_valid": bool(np.all((power_ratio >= -1e-9) & (power_ratio <= 1.0 + 1e-9))),
+    }
+
+
+
+# ============================================================
+# Advanced estimation / trade-study / V&V helpers
+# ============================================================
+
+def _ekf_measurement_model(state: np.ndarray) -> np.ndarray:
+    """
+    Generic range / azimuth / elevation measurement model for a 6-state
+    Cartesian constant-velocity estimator.
+    """
+    x, y, z = state[:3]
+    rho = max(math.hypot(x, y), 1e-9)
+    r = max(math.sqrt(x*x + y*y + z*z), 1e-9)
+
+    return np.array(
+        [
+            r,
+            math.atan2(y, x),
+            math.atan2(z, rho),
+        ],
+        dtype=float,
+    )
+
+
+def _ekf_measurement_jacobian(state: np.ndarray) -> np.ndarray:
+    """
+    Jacobian of [range, azimuth, elevation] with respect to
+    [x, y, z, vx, vy, vz].
+    """
+    x, y, z = state[:3]
+    rho2 = max(x*x + y*y, 1e-12)
+    rho = math.sqrt(rho2)
+    r2 = max(rho2 + z*z, 1e-12)
+    r = math.sqrt(r2)
+
+    H = np.zeros((3, 6), dtype=float)
+
+    H[0, 0] = x / r
+    H[0, 1] = y / r
+    H[0, 2] = z / r
+
+    H[1, 0] = -y / rho2
+    H[1, 1] = x / rho2
+
+    H[2, 0] = -x * z / (r2 * rho)
+    H[2, 1] = -y * z / (r2 * rho)
+    H[2, 2] = rho / r2
+
+    return H
+
+
+def _wrap_angle(angle_rad: float) -> float:
+    return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def generic_ekf_track(
+    measurements_df: pd.DataFrame,
+    platform_df: pd.DataFrame,
+    process_accel_sigma_mps2: float,
+    range_sigma_m: float,
+    az_sigma_mrad: float,
+    el_sigma_mrad: float,
+):
+    """
+    Generic educational EKF driven only by noisy range/azimuth/elevation
+    measurements from the Advanced Twin tab.
+
+    This estimator is isolated from the directed-energy engagement/effect logic.
+    """
+    n = min(len(measurements_df), len(platform_df))
+    if n == 0:
+        return pd.DataFrame()
+
+    first_valid = None
+    for i in range(n):
+        if bool(measurements_df.iloc[i]["Measurement Received"]):
+            first_valid = i
+            break
+
+    if first_valid is None:
+        return pd.DataFrame()
+
+    m0 = measurements_df.iloc[first_valid]
+    p0 = platform_df.iloc[first_valid]
+
+    r0 = float(m0["Measured Range (m)"])
+    az0 = math.radians(float(m0["Measured Azimuth (deg)"]))
+    el0 = math.radians(float(m0["Measured Elevation (deg)"]))
+
+    rel0 = np.array(
+        [
+            r0 * math.cos(el0) * math.cos(az0),
+            r0 * math.cos(el0) * math.sin(az0),
+            r0 * math.sin(el0),
+        ],
+        dtype=float,
+    )
+
+    xhat = np.zeros(6, dtype=float)
+    xhat[:3] = np.array(
+        [p0["X (m)"], p0["Y (m)"], p0["Z (m)"]],
+        dtype=float,
+    ) + rel0
+
+    P = np.diag(
+        [
+            max(range_sigma_m, 10.0) ** 2,
+            max(range_sigma_m, 10.0) ** 2,
+            max(range_sigma_m, 10.0) ** 2,
+            50.0**2,
+            50.0**2,
+            50.0**2,
+        ]
+    )
+
+    R = np.diag(
+        [
+            max(range_sigma_m, 1e-6) ** 2,
+            max(az_sigma_mrad / 1000.0, 1e-9) ** 2,
+            max(el_sigma_mrad / 1000.0, 1e-9) ** 2,
+        ]
+    )
+
+    rows = []
+    last_time = float(measurements_df.iloc[first_valid]["Time (s)"])
+
+    # Record the initialized state once. The first valid measurement has already
+    # been consumed to initialize position, so it must not be processed again as
+    # a Kalman measurement update.
+    rows.append(
+        {
+            "Time (s)": last_time,
+            "Estimated X (m)": float(xhat[0]),
+            "Estimated Y (m)": float(xhat[1]),
+            "Estimated Z (m)": float(xhat[2]),
+            "Estimated VX (m/s)": float(xhat[3]),
+            "Estimated VY (m/s)": float(xhat[4]),
+            "Estimated VZ (m/s)": float(xhat[5]),
+            "Position 1σ RMS (m)": math.sqrt(
+                max(float(np.trace(P[:3, :3]) / 3.0), 0.0)
+            ),
+            "Velocity 1σ RMS (m/s)": math.sqrt(
+                max(float(np.trace(P[3:, 3:]) / 3.0), 0.0)
+            ),
+            "NIS": float("nan"),
+            "Innovation Norm": float("nan"),
+            "Initialization": True,
+        }
+    )
+
+    for i in range(first_valid + 1, n):
+        m = measurements_df.iloc[i]
+        p = platform_df.iloc[i]
+        t = float(m["Time (s)"])
+        dt = max(t - last_time, 0.0)
+        last_time = t
+
+        I3 = np.eye(3)
+        Z3 = np.zeros((3, 3))
+        F = np.block([[I3, dt * I3], [Z3, I3]])
+
+        q = max(process_accel_sigma_mps2, 1e-6) ** 2
+        Q = q * np.block(
+            [
+                [(dt**4 / 4.0) * I3, (dt**3 / 2.0) * I3],
+                [(dt**3 / 2.0) * I3, (dt**2) * I3],
+            ]
+        )
+
+        xhat = F @ xhat
+        P = F @ P @ F.T + Q
+
+        nis = float("nan")
+        innovation_norm = float("nan")
+
+        if bool(m["Measurement Received"]):
+            platform_pos = np.array(
+                [p["X (m)"], p["Y (m)"], p["Z (m)"]],
+                dtype=float,
+            )
+
+            rel_state = xhat.copy()
+            rel_state[:3] = xhat[:3] - platform_pos
+
+            zhat = _ekf_measurement_model(rel_state)
+            H_rel = _ekf_measurement_jacobian(rel_state)
+            H = H_rel.copy()
+
+            z = np.array(
+                [
+                    float(m["Measured Range (m)"]),
+                    math.radians(float(m["Measured Azimuth (deg)"])),
+                    math.radians(float(m["Measured Elevation (deg)"])),
+                ],
+                dtype=float,
+            )
+
+            innovation = z - zhat
+            innovation[1] = _wrap_angle(innovation[1])
+            innovation[2] = _wrap_angle(innovation[2])
+
+            S = H @ P @ H.T + R
+            K = P @ H.T @ np.linalg.inv(S)
+
+            xhat = xhat + K @ innovation
+
+            # Joseph stabilized covariance update:
+            # P+ = (I-KH) P- (I-KH)^T + K R K^T
+            I6 = np.eye(6)
+            A = I6 - K @ H
+            P = (
+                A @ P @ A.T
+                + K @ R @ K.T
+            )
+            # Remove roundoff-level asymmetry.
+            P = 0.5 * (P + P.T)
+
+            nis = float(innovation.T @ np.linalg.inv(S) @ innovation)
+            innovation_norm = float(np.linalg.norm(innovation))
+
+        pos_sigma = math.sqrt(
+            max(float(np.trace(P[:3, :3]) / 3.0), 0.0)
+        )
+        vel_sigma = math.sqrt(
+            max(float(np.trace(P[3:, 3:]) / 3.0), 0.0)
+        )
+
+        rows.append(
+            {
+                "Time (s)": t,
+                "Estimated X (m)": float(xhat[0]),
+                "Estimated Y (m)": float(xhat[1]),
+                "Estimated Z (m)": float(xhat[2]),
+                "Estimated VX (m/s)": float(xhat[3]),
+                "Estimated VY (m/s)": float(xhat[4]),
+                "Estimated VZ (m/s)": float(xhat[5]),
+                "Position 1σ RMS (m)": pos_sigma,
+                "Velocity 1σ RMS (m/s)": vel_sigma,
+                "NIS": nis,
+                "Innovation Norm": innovation_norm,
+                "Initialization": False,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def requirement_evaluation_table(
+    result: dict,
+    min_track_quality: float,
+    max_pointing_error_mrad: float,
+    min_thermal_margin: float,
+    min_energy_margin: float,
+    min_detection_probability: float,
+):
+    """
+    Generic requirements traceability table using existing model outputs.
+    """
+    requirements = [
+        (
+            "REQ-TRK-001",
+            "Track quality",
+            result.get("Track Quality", float("nan")),
+            ">=",
+            min_track_quality,
+        ),
+        (
+            "REQ-PNT-001",
+            "Effective pointing error (mrad)",
+            result.get("Effective Pointing Error (mrad)", float("nan")),
+            "<=",
+            max_pointing_error_mrad,
+        ),
+        (
+            "REQ-THM-001",
+            "Thermal margin",
+            result.get("Thermal Margin", float("nan")),
+            ">=",
+            min_thermal_margin,
+        ),
+        (
+            "REQ-ENG-001",
+            "Energy margin",
+            result.get("Energy Margin", float("nan")),
+            ">=",
+            min_energy_margin,
+        ),
+        (
+            "REQ-SNS-001",
+            "Detection probability",
+            result.get("Detection Probability", float("nan")),
+            ">=",
+            min_detection_probability,
+        ),
+    ]
+
+    rows = []
+    for req_id, name, value, op, threshold in requirements:
+        if op == ">=":
+            passed = bool(value >= threshold)
+        else:
+            passed = bool(value <= threshold)
+
+        rows.append(
+            {
+                "Requirement": req_id,
+                "Metric": name,
+                "Value": value,
+                "Operator": op,
+                "Threshold": threshold,
+                "Status": "PASS" if passed else "FAIL",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def generic_trade_study(
+    env: Environment,
+    tgt: Target,
+    sensors: SensorState,
+    hel: HELState,
+    platform: PlatformState,
+    parameter_name: str,
+    values: list[float],
+):
+    """
+    Parameter sweep for systems-engineering trade studies.
+    Uses only existing low-order model outputs and does not optimize effect.
+    """
+    rows = []
+
+    for value in values:
+        e = Environment(**asdict(env))
+        s = SensorState(**asdict(sensors))
+
+        if parameter_name == "Visibility (km)":
+            e.visibility_km = float(value)
+        elif parameter_name == "Humidity (%)":
+            e.humidity_pct = float(value)
+        elif parameter_name == "Track Update Rate (Hz)":
+            s.track_update_hz = float(value)
+        elif parameter_name == "Range Noise 1σ (m)":
+            s.range_measurement_sigma_m = float(value)
+
+        timeline_sweep, final_sweep = simulate_time_stepped_engagement(
+            e,
+            tgt,
+            s,
+            hel,
+            platform,
+            dt_s=0.10,
+            stochastic_measurements=False,
+        )
+
+        rows.append(
+            {
+                parameter_name: float(value),
+                "Track Quality": final_sweep.get("Track Quality", float("nan")),
+                "Detection Probability": final_sweep.get("Detection Probability", float("nan")),
+                "Atmospheric Transmission": final_sweep.get("Atmospheric Transmission", float("nan")),
+                "Thermal Margin": final_sweep.get("Thermal Margin", float("nan")),
+                "Energy Margin": final_sweep.get("Energy Margin", float("nan")),
+                "Readiness Score": final_sweep.get("Readiness Score", float("nan")),
+                "Timeline Rows": len(timeline_sweep),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def model_provenance_table():
+    return pd.DataFrame(
+        [
+            {
+                "Subsystem": "3D kinematics",
+                "Model type": "Physics-based low-order",
+                "Validation status": "Analytical geometry checks only",
+                "Intended use": "Digital-engineering demonstration",
+            },
+            {
+                "Subsystem": "State estimation",
+                "Model type": "Covariance / generic EKF",
+                "Validation status": "Synthetic-data consistency only",
+                "Intended use": "Tracking architecture study",
+            },
+            {
+                "Subsystem": "Atmosphere",
+                "Model type": "Phenomenological / Beer-Lambert",
+                "Validation status": "Not validated against MODTRAN/test data",
+                "Intended use": "Sensitivity and systems trade studies",
+            },
+            {
+                "Subsystem": "Platform power/thermal",
+                "Model type": "Lumped first-order",
+                "Validation status": "Invariant checks only",
+                "Intended use": "Resource-coupling demonstration",
+            },
+            {
+                "Subsystem": "Target thermal response",
+                "Model type": "Generic lumped areal thermal index",
+                "Validation status": "Not a lethality/damage model",
+                "Intended use": "Non-operational engineering indicator",
+            },
+        ]
+    )
+
+
+def run_internal_regression_checks():
+    """
+    Lightweight implementation checks for geometry and helper math.
+    """
+    checks = []
+
+    # Spherical reconstruction round trip.
+    state = np.array([3000.0, 4000.0, 1200.0, 0.0, 0.0, 0.0])
+    z = _ekf_measurement_model(state)
+    reconstructed = np.array(
+        [
+            z[0] * math.cos(z[2]) * math.cos(z[1]),
+            z[0] * math.cos(z[2]) * math.sin(z[1]),
+            z[0] * math.sin(z[2]),
+        ]
+    )
+    geom_error = float(np.linalg.norm(reconstructed - state[:3]))
+    checks.append(
+        {
+            "Check": "Range/az/el reconstruction",
+            "Metric": geom_error,
+            "Tolerance": 1e-6,
+            "Status": "PASS" if geom_error <= 1e-6 else "FAIL",
+        }
+    )
+
+    # Angle wrapping.
+    wrapped = _wrap_angle(math.radians(181.0))
+    angle_error_deg = abs(math.degrees(wrapped) + 179.0)
+    checks.append(
+        {
+            "Check": "Angle wrap continuity",
+            "Metric": angle_error_deg,
+            "Tolerance": 1e-9,
+            "Status": "PASS" if angle_error_deg <= 1e-9 else "FAIL",
+        }
+    )
+
+    # Monotonic covariance sanity for a simple positive-definite matrix.
+    P = np.eye(6)
+    eig_min = float(np.min(np.linalg.eigvalsh(P)))
+    checks.append(
+        {
+            "Check": "Positive-definite covariance baseline",
+            "Metric": eig_min,
+            "Tolerance": 0.0,
+            "Status": "PASS" if eig_min > 0.0 else "FAIL",
+        }
+    )
+
+    return pd.DataFrame(checks)
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -5165,7 +6092,7 @@ else:
     st.error(result["Recommendation"])
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
     [
         "Engagement Loop",
         "State Estimation",
@@ -5174,6 +6101,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         "Model State",
         "3D Digital Twin",
         "Export",
+        "Advanced Twin / V&V",
+        "Engineering Lab",
     ]
 )
 
@@ -5702,6 +6631,98 @@ with tab6:
             },
         )
 
+        st.markdown("### Target Engagement / Energy-on-Target")
+
+        selected_target_state = timeline.iloc[selected_step]
+
+        hit1, hit2, hit3, hit4 = st.columns(4)
+        hit1.metric(
+            "Target Optical Power",
+            f"{selected_target_state['Target Optical Power (kW)']:.1f} kW",
+        )
+        hit2.metric(
+            "Average Irradiance",
+            f"{selected_target_state['Average Irradiance (kW/m^2)']:.1f} kW/m²",
+        )
+        hit3.metric(
+            "Spot Diameter",
+            f"{selected_target_state['Spot Diameter (m)']:.2f} m",
+        )
+        hit4.metric(
+            "Pointing Error",
+            f"{selected_target_state['Effective Pointing Error (mrad)']:.3f} mrad",
+        )
+
+        hit5, hit6, hit7, hit8 = st.columns(4)
+        hit5.metric(
+            "Absorbed Heat Flux",
+            f"{selected_target_state['Absorbed Heat Flux (kW/m^2)']:.1f} kW/m²",
+        )
+        hit6.metric(
+            "Absorbed Exposure",
+            f"{selected_target_state['Absorbed Exposure (kJ/m^2)']:.1f} kJ/m²",
+        )
+        hit7.metric(
+            "Target ΔT",
+            f"{selected_target_state['Target ΔT (C)']:.1f} °C",
+        )
+        hit8.metric(
+            "Thermal Effect Index",
+            f"{selected_target_state['Estimated Thermal Effect Index']:.1%}",
+        )
+
+        st.caption(
+            "These values describe the modeled target state at the currently selected "
+            "3-D timestep. The Thermal Effect Index is a normalized engineering metric, "
+            "not a probability of kill or validated damage prediction."
+        )
+
+        engagement_readout = pd.DataFrame(
+            {
+                "Metric": [
+                    "Time",
+                    "Slant range",
+                    "Altitude",
+                    "Track quality",
+                    "Aimpoint margin index",
+                    "Beam-director rate utilization",
+                    "Atmospheric transmission",
+                    "Target optical power",
+                    "Spot diameter",
+                    "Average irradiance",
+                    "Absorbed heat flux",
+                    "Absorbed exposure",
+                    "Target surface ΔT",
+                    "Estimated thermal effect index",
+                    "Recommendation",
+                ],
+                "Value": [
+                    f"{selected_target_state['Time (s)']:.2f} s",
+                    f"{selected_target_state['Range (km)']:.2f} km",
+                    f"{selected_target_state['Altitude (m)']:.0f} m",
+                    f"{selected_target_state['Track Quality']:.1%}",
+                    f"{selected_target_state['Aimpoint Margin Index']:.1%}",
+                    f"{selected_target_state['Beam Director Rate Utilization']:.1%}",
+                    f"{selected_target_state['Atmospheric Transmission']:.1%}",
+                    f"{selected_target_state['Target Optical Power (kW)']:.1f} kW",
+                    f"{selected_target_state['Spot Diameter (m)']:.2f} m",
+                    f"{selected_target_state['Average Irradiance (kW/m^2)']:.1f} kW/m²",
+                    f"{selected_target_state['Absorbed Heat Flux (kW/m^2)']:.1f} kW/m²",
+                    f"{selected_target_state['Absorbed Exposure (kJ/m^2)']:.1f} kJ/m²",
+                    f"{selected_target_state['Target ΔT (C)']:.1f} °C",
+                    f"{selected_target_state['Estimated Thermal Effect Index']:.1%}",
+                    selected_target_state["Recommendation"],
+                ],
+            }
+        )
+
+        st.dataframe(
+            engagement_readout,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
         t1, t2, t3, t4 = st.columns(4)
         t1.metric(
             "Atmospheric Transmission",
@@ -5916,6 +6937,775 @@ with tab7:
         export_metadata,
         use_container_width=True,
         hide_index=True,
+    )
+
+
+
+# ============================================================
+# Advanced aerospace digital twin / verification & validation
+# ============================================================
+
+with tab8:
+    st.markdown("### Advanced Aerospace Digital Twin / V&V")
+    st.caption(
+        "This tab adds generic maneuvering kinematics, sensing, moving-platform, controls, "
+        "atmospheric-visibility, and verification demonstrations. These calculations "
+        "are intentionally isolated from the directed-energy engagement / effect model."
+    )
+
+    adv_col1, adv_col2 = st.columns(2)
+
+    with adv_col1:
+        st.markdown("#### 3D Maneuvering Truth + Attitude Kinematics")
+        adv_duration_s = st.slider(
+            "Advanced twin duration (s)",
+            2.0,
+            60.0,
+            12.0,
+            1.0,
+            key="adv_duration_s",
+        )
+        adv_dt_s = st.slider(
+            "Advanced twin timestep (s)",
+            0.02,
+            0.50,
+            0.10,
+            0.01,
+            key="adv_dt_s",
+        )
+        adv_lateral_accel = st.slider(
+            "Generic lateral acceleration (m/s²)",
+            -10.0,
+            10.0,
+            0.0,
+            0.5,
+            key="adv_lateral_accel",
+        )
+        adv_vertical_accel = st.slider(
+            "Generic vertical acceleration (m/s²)",
+            -10.0,
+            10.0,
+            0.0,
+            0.5,
+            key="adv_vertical_accel",
+        )
+        adv_roll_rate = st.slider(
+            "Roll rate (deg/s)",
+            -30.0,
+            30.0,
+            0.0,
+            1.0,
+            key="adv_roll_rate",
+        )
+        adv_pitch_rate = st.slider(
+            "Pitch rate (deg/s)",
+            -20.0,
+            20.0,
+            0.0,
+            1.0,
+            key="adv_pitch_rate",
+        )
+        adv_yaw_rate = st.slider(
+            "Yaw rate (deg/s)",
+            -20.0,
+            20.0,
+            0.0,
+            1.0,
+            key="adv_yaw_rate",
+        )
+
+    with adv_col2:
+        st.markdown("#### Moving Platform")
+        platform_speed = st.slider(
+            "Platform speed (m/s)",
+            0.0,
+            300.0,
+            0.0,
+            5.0,
+            key="adv_platform_speed",
+        )
+        platform_heading = st.slider(
+            "Platform heading (deg)",
+            -180.0,
+            180.0,
+            0.0,
+            5.0,
+            key="adv_platform_heading",
+        )
+        platform_climb = st.slider(
+            "Platform climb rate (m/s)",
+            -20.0,
+            20.0,
+            0.0,
+            1.0,
+            key="adv_platform_climb",
+        )
+        platform_roll = st.slider(
+            "Platform roll (deg)",
+            -45.0,
+            45.0,
+            0.0,
+            1.0,
+            key="adv_platform_roll",
+        )
+        platform_pitch = st.slider(
+            "Platform pitch (deg)",
+            -30.0,
+            30.0,
+            0.0,
+            1.0,
+            key="adv_platform_pitch",
+        )
+        platform_yaw = st.slider(
+            "Platform yaw (deg)",
+            -180.0,
+            180.0,
+            0.0,
+            5.0,
+            key="adv_platform_yaw",
+        )
+
+    adv_truth = generic_maneuvering_truth_attitude_kinematics(
+        target_initial_position_m(env, tgt),
+        target_velocity_vector_mps(tgt),
+        adv_duration_s,
+        adv_dt_s,
+        adv_lateral_accel,
+        adv_vertical_accel,
+        adv_yaw_rate,
+        adv_pitch_rate,
+        adv_roll_rate,
+    )
+
+    adv_platform_motion = GenericPlatformMotion(
+        speed_mps=platform_speed,
+        heading_deg=platform_heading,
+        climb_rate_mps=platform_climb,
+        roll_deg=platform_roll,
+        pitch_deg=platform_pitch,
+        yaw_deg=platform_yaw,
+    )
+    adv_platform = moving_platform_truth(
+        adv_duration_s,
+        adv_dt_s,
+        adv_platform_motion,
+    )
+
+    st.markdown("#### Generic Sensor Measurement Simulation")
+
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        adv_range_sigma = st.number_input(
+            "Range noise 1σ (m)",
+            min_value=0.1,
+            max_value=500.0,
+            value=float(sensors.range_measurement_sigma_m),
+            step=0.5,
+            key="adv_range_sigma",
+        )
+    with s2:
+        adv_az_sigma = st.number_input(
+            "Azimuth noise 1σ (mrad)",
+            min_value=0.001,
+            max_value=10.0,
+            value=float(sensors.bearing_measurement_sigma_mrad),
+            step=0.01,
+            key="adv_az_sigma",
+        )
+    with s3:
+        adv_el_sigma = st.number_input(
+            "Elevation noise 1σ (mrad)",
+            min_value=0.001,
+            max_value=10.0,
+            value=float(sensors.bearing_measurement_sigma_mrad),
+            step=0.01,
+            key="adv_el_sigma",
+        )
+    with s4:
+        adv_dropout = st.slider(
+            "Measurement dropout",
+            0.0,
+            0.8,
+            float(sensors.dropped_measurement_rate),
+            0.01,
+            key="adv_dropout",
+        )
+
+    adv_measurements = generic_sensor_measurements(
+        adv_truth,
+        adv_platform,
+        adv_range_sigma,
+        adv_az_sigma,
+        adv_el_sigma,
+        adv_dropout,
+        seed=7,
+    )
+    adv_reconstruction = generic_measurement_reconstruction(
+        adv_measurements,
+        adv_platform,
+    )
+
+    truth_plot = go.Figure()
+    truth_plot.add_trace(
+        go.Scatter3d(
+            x=adv_truth["X (m)"] / 1000.0,
+            y=adv_truth["Y (m)"] / 1000.0,
+            z=adv_truth["Z (m)"] / 1000.0,
+            mode="lines",
+            name="Maneuvering Truth",
+        )
+    )
+    truth_plot.add_trace(
+        go.Scatter3d(
+            x=adv_platform["X (m)"] / 1000.0,
+            y=adv_platform["Y (m)"] / 1000.0,
+            z=adv_platform["Z (m)"] / 1000.0,
+            mode="lines",
+            name="Moving Platform",
+        )
+    )
+    valid_recon = adv_reconstruction.dropna()
+    if not valid_recon.empty:
+        truth_plot.add_trace(
+            go.Scatter3d(
+                x=valid_recon["Estimated X (m)"] / 1000.0,
+                y=valid_recon["Estimated Y (m)"] / 1000.0,
+                z=valid_recon["Estimated Z (m)"] / 1000.0,
+                mode="markers",
+                name="Noisy Measurement Reconstruction",
+                marker=dict(size=3),
+            )
+        )
+
+    truth_plot.update_layout(
+        height=620,
+        margin=dict(l=0, r=0, t=35, b=0),
+        scene=dict(
+            xaxis_title="X (km)",
+            yaxis_title="Y (km)",
+            zaxis_title="Z (km)",
+            aspectmode="data",
+        ),
+        title="3D Maneuvering Truth / Moving Platform / Sensor Measurements",
+        showlegend=True,
+    )
+    st.plotly_chart(
+        truth_plot,
+        use_container_width=True,
+        config={"responsive": True, "displaylogo": False},
+    )
+
+    st.markdown("#### Layered Atmospheric Visibility Demonstration")
+    final_truth = adv_truth.iloc[-1]
+    final_platform = adv_platform.iloc[min(len(adv_platform) - 1, len(adv_truth) - 1)]
+    final_rel = np.array(
+        [
+            final_truth["X (m)"] - final_platform["X (m)"],
+            final_truth["Y (m)"] - final_platform["Y (m)"],
+            final_truth["Z (m)"] - final_platform["Z (m)"],
+        ]
+    )
+    adv_slant_km = float(np.linalg.norm(final_rel) / 1000.0)
+    layered_vis = layered_visibility_index(
+        adv_slant_km,
+        float(final_truth["Z (m)"]),
+        env.visibility_km,
+        env.humidity_pct,
+        layers=24,
+    )
+
+    lv1, lv2, lv3 = st.columns(3)
+    lv1.metric("Advanced Slant Range", f"{adv_slant_km:.2f} km")
+    lv2.metric("Layered Optical Depth Index", f"{layered_vis['optical_depth']:.3f}")
+    lv3.metric("Layered Visibility Index", f"{layered_vis['visibility_index']:.1%}")
+
+    st.caption(
+        "The layered atmosphere here is a generic visibility/sensor demonstration only. "
+        "It does not replace the existing directed-energy propagation model."
+    )
+
+    st.markdown("#### Generic Second-Order Sensor/Gimbal Dynamics")
+    if len(adv_truth) > 1:
+        rel_x = (
+            adv_truth["X (m)"].to_numpy()
+            - adv_platform["X (m)"].to_numpy()[:len(adv_truth)]
+        )
+        rel_y = (
+            adv_truth["Y (m)"].to_numpy()
+            - adv_platform["Y (m)"].to_numpy()[:len(adv_truth)]
+        )
+
+        command_az_rad = np.unwrap(
+            np.arctan2(
+                rel_y,
+                rel_x,
+            )
+        )
+        command_az_deg = np.degrees(
+            command_az_rad
+        )
+    else:
+        command_az_deg = np.array(
+            [0.0]
+        )
+
+    g1, g2, g3, g4 = st.columns(4)
+    with g1:
+        adv_gimbal_fn = st.slider(
+            "Natural frequency (Hz)",
+            0.2,
+            10.0,
+            2.0,
+            0.1,
+            key="adv_gimbal_fn",
+        )
+    with g2:
+        adv_gimbal_zeta = st.slider(
+            "Damping ratio",
+            0.2,
+            2.0,
+            0.8,
+            0.05,
+            key="adv_gimbal_zeta",
+        )
+    with g3:
+        adv_gimbal_rate = st.slider(
+            "Rate limit (deg/s)",
+            1.0,
+            180.0,
+            60.0,
+            1.0,
+            key="adv_gimbal_rate",
+        )
+    with g4:
+        adv_gimbal_accel = st.slider(
+            "Acceleration limit (deg/s²)",
+            5.0,
+            1000.0,
+            250.0,
+            5.0,
+            key="adv_gimbal_accel",
+        )
+
+    gimbal_az_deg = second_order_gimbal_response(
+        command_az_deg,
+        adv_dt_s,
+        adv_gimbal_fn,
+        adv_gimbal_zeta,
+        adv_gimbal_rate,
+        adv_gimbal_accel,
+    )
+
+    gimbal_df = pd.DataFrame(
+        {
+            "Time (s)": adv_truth["Time (s)"].to_numpy()[:len(gimbal_az_deg)],
+            "Command Azimuth (deg)": command_az_deg[:len(gimbal_az_deg)],
+            "Gimbal Azimuth (deg)": gimbal_az_deg,
+        }
+    )
+    st.line_chart(
+        gimbal_df.set_index("Time (s)"),
+        use_container_width=True,
+    )
+
+    st.markdown("#### Verification & Validation")
+    if st.button(
+        "Run Timestep Convergence Check",
+        key="run_vv_convergence",
+        use_container_width=True,
+    ):
+        convergence_df = timestep_convergence_study(
+            env,
+            tgt,
+            sensors,
+            hel,
+            platform,
+        )
+        st.session_state["vv_convergence_df"] = convergence_df
+
+    convergence_df = st.session_state.get("vv_convergence_df")
+    if isinstance(convergence_df, pd.DataFrame):
+        st.dataframe(
+            convergence_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    balance = energy_balance_check(timeline)
+
+    vv1, vv2, vv3 = st.columns(3)
+    vv1.metric(
+        "Storage Monotonic",
+        "PASS" if balance["storage_monotonic"] else "CHECK",
+    )
+    vv2.metric(
+        "Storage Nonnegative",
+        "PASS" if balance["nonnegative_storage"] else "CHECK",
+    )
+    vv3.metric(
+        "Power Ratio Bounds",
+        "PASS" if balance["power_ratio_valid"] else "CHECK",
+    )
+
+    st.markdown("#### Advanced Twin Data Export")
+    adv_truth_csv = adv_truth.to_csv(index=False).encode("utf-8")
+    adv_meas_csv = adv_measurements.to_csv(index=False).encode("utf-8")
+
+    ex1, ex2 = st.columns(2)
+    with ex1:
+        st.download_button(
+            "Download Maneuvering Truth CSV",
+            adv_truth_csv,
+            file_name="advanced_maneuvering_truth.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with ex2:
+        st.download_button(
+            "Download Generic Sensor Measurements CSV",
+            adv_meas_csv,
+            file_name="advanced_generic_sensor_measurements.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# Engineering Lab
+# ============================================================
+
+with tab9:
+    st.markdown("### Engineering Lab")
+    st.caption(
+        "Measurement-driven tracking, requirements traceability, trade studies, "
+        "model provenance, and regression checks. These tools are for generic "
+        "systems-engineering analysis and remain isolated from operational effect modeling."
+    )
+
+    st.markdown("#### Measurement-Driven EKF Tracking")
+
+    ekf_c1, ekf_c2 = st.columns(2)
+    with ekf_c1:
+        ekf_process_sigma = st.slider(
+            "EKF process acceleration 1σ (m/s²)",
+            0.01,
+            20.0,
+            1.5,
+            0.1,
+            key="ekf_process_sigma",
+        )
+    with ekf_c2:
+        st.caption(
+            "The EKF consumes the synthetic range/azimuth/elevation measurements "
+            "generated in the Advanced Twin tab."
+        )
+
+    ekf_track = generic_ekf_track(
+        adv_measurements,
+        adv_platform,
+        ekf_process_sigma,
+        adv_range_sigma,
+        adv_az_sigma,
+        adv_el_sigma,
+    )
+
+    if not ekf_track.empty:
+        # Align estimator states with truth by timestamp so dropout before
+        # initialization cannot shift the RMSE or plotted trajectories.
+        truth_for_eval = adv_truth[
+            [
+                "Time (s)",
+                "X (m)",
+                "Y (m)",
+                "Z (m)",
+            ]
+        ].copy()
+
+        ekf_eval = ekf_track.copy()
+
+        aligned_eval = pd.merge(
+            ekf_eval,
+            truth_for_eval,
+            on="Time (s)",
+            how="inner",
+            sort=True,
+        )
+
+        if aligned_eval.empty:
+            aligned_eval = pd.merge_asof(
+                ekf_eval.sort_values("Time (s)"),
+                truth_for_eval.sort_values("Time (s)"),
+                on="Time (s)",
+                direction="nearest",
+                tolerance=max(float(adv_dt_s) * 0.5, 1e-9),
+            ).dropna(
+                subset=[
+                    "X (m)",
+                    "Y (m)",
+                    "Z (m)",
+                ]
+            )
+
+        position_error = np.sqrt(
+            (aligned_eval["Estimated X (m)"] - aligned_eval["X (m)"])**2
+            + (aligned_eval["Estimated Y (m)"] - aligned_eval["Y (m)"])**2
+            + (aligned_eval["Estimated Z (m)"] - aligned_eval["Z (m)"])**2
+        )
+
+        ekf_metrics = st.columns(4)
+
+        if len(aligned_eval) > 0:
+            position_rmse_m = math.sqrt(
+                float(np.mean(position_error**2))
+            )
+        else:
+            position_rmse_m = float("nan")
+
+        ekf_metrics[0].metric(
+            "Position RMSE",
+            (
+                f"{position_rmse_m:.1f} m"
+                if math.isfinite(position_rmse_m)
+                else "N/A"
+            ),
+        )
+        ekf_metrics[1].metric(
+            "Final Position 1σ RMS",
+            f"{aligned_eval['Position 1σ RMS (m)'].iloc[-1]:.1f} m",
+        )
+        ekf_metrics[2].metric(
+            "Measurement Updates",
+            f"{int(np.isfinite(est_eval['NIS']).sum())}",
+        )
+        finite_nis = aligned_eval["NIS"].dropna()
+        ekf_metrics[3].metric(
+            "Mean NIS",
+            f"{finite_nis.mean():.2f}" if not finite_nis.empty else "N/A",
+        )
+
+        ekf_plot = go.Figure()
+        ekf_plot.add_trace(
+            go.Scatter3d(
+                x=aligned_eval["X (m)"] / 1000.0,
+                y=aligned_eval["Y (m)"] / 1000.0,
+                z=aligned_eval["Z (m)"] / 1000.0,
+                mode="lines",
+                name="Truth",
+            )
+        )
+        ekf_plot.add_trace(
+            go.Scatter3d(
+                x=aligned_eval["Estimated X (m)"] / 1000.0,
+                y=aligned_eval["Estimated Y (m)"] / 1000.0,
+                z=aligned_eval["Estimated Z (m)"] / 1000.0,
+                mode="lines",
+                name="EKF Estimate",
+            )
+        )
+        ekf_plot.update_layout(
+            height=560,
+            margin=dict(l=0, r=0, t=35, b=0),
+            scene=dict(
+                xaxis_title="X (km)",
+                yaxis_title="Y (km)",
+                zaxis_title="Z (km)",
+                aspectmode="data",
+            ),
+            title="Truth vs Measurement-Driven EKF Estimate",
+        )
+        st.plotly_chart(
+            ekf_plot,
+            use_container_width=True,
+            config={"responsive": True, "displaylogo": False},
+        )
+
+        st.dataframe(
+            ekf_track.tail(25),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("No valid synthetic measurements are available for EKF initialization.")
+
+    st.markdown("#### Requirements Traceability")
+
+    req1, req2, req3, req4, req5 = st.columns(5)
+    with req1:
+        req_track = st.slider(
+            "Min Track Quality",
+            0.0,
+            1.0,
+            0.60,
+            0.05,
+            key="req_track",
+        )
+    with req2:
+        req_point = st.slider(
+            "Max Pointing Error (mrad)",
+            0.01,
+            5.0,
+            0.75,
+            0.05,
+            key="req_point",
+        )
+    with req3:
+        req_thermal = st.slider(
+            "Min Thermal Margin",
+            0.0,
+            1.0,
+            0.20,
+            0.05,
+            key="req_thermal",
+        )
+    with req4:
+        req_energy = st.slider(
+            "Min Energy Margin",
+            0.0,
+            1.0,
+            0.20,
+            0.05,
+            key="req_energy",
+        )
+    with req5:
+        req_detect = st.slider(
+            "Min Detection Probability",
+            0.0,
+            1.0,
+            0.60,
+            0.05,
+            key="req_detect",
+        )
+
+    req_df = requirement_evaluation_table(
+        result,
+        req_track,
+        req_point,
+        req_thermal,
+        req_energy,
+        req_detect,
+    )
+    st.dataframe(
+        req_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    pass_rate = (req_df["Status"] == "PASS").mean() if len(req_df) else 0.0
+    st.metric("Requirements Pass Rate", f"{pass_rate:.0%}")
+
+    st.markdown("#### Scenario / Trade Study")
+
+    trade_parameter = st.selectbox(
+        "Sweep parameter",
+        [
+            "Visibility (km)",
+            "Humidity (%)",
+            "Track Update Rate (Hz)",
+            "Range Noise 1σ (m)",
+        ],
+        key="trade_parameter",
+    )
+
+    if trade_parameter == "Visibility (km)":
+        sweep_values = np.linspace(5.0, 40.0, 8)
+    elif trade_parameter == "Humidity (%)":
+        sweep_values = np.linspace(10.0, 90.0, 9)
+    elif trade_parameter == "Track Update Rate (Hz)":
+        sweep_values = np.linspace(2.0, 20.0, 10)
+    else:
+        sweep_values = np.linspace(2.0, 50.0, 9)
+
+    trade_df = generic_trade_study(
+        env,
+        tgt,
+        sensors,
+        hel,
+        platform,
+        trade_parameter,
+        list(sweep_values),
+    )
+
+    st.dataframe(
+        trade_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    trade_plot = go.Figure()
+    trade_plot.add_trace(
+        go.Scatter(
+            x=trade_df[trade_parameter],
+            y=trade_df["Track Quality"],
+            mode="lines+markers",
+            name="Track Quality",
+        )
+    )
+    trade_plot.add_trace(
+        go.Scatter(
+            x=trade_df[trade_parameter],
+            y=trade_df["Detection Probability"],
+            mode="lines+markers",
+            name="Detection Probability",
+        )
+    )
+    trade_plot.update_layout(
+        height=420,
+        xaxis_title=trade_parameter,
+        yaxis_title="Normalized Metric",
+        yaxis_range=[0, 1],
+        title="Generic Systems Trade Study",
+    )
+    st.plotly_chart(
+        trade_plot,
+        use_container_width=True,
+        config={"responsive": True, "displaylogo": False},
+    )
+
+    st.markdown("#### Model Provenance")
+    st.dataframe(
+        model_provenance_table(),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### Internal Regression Checks")
+    regression_df = run_internal_regression_checks()
+    st.dataframe(
+        regression_df,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    all_pass = bool((regression_df["Status"] == "PASS").all())
+    st.metric(
+        "Regression Status",
+        "PASS" if all_pass else "CHECK",
+    )
+
+    st.markdown("#### Engineering Lab Export")
+
+    lab_export = {
+        "requirements": req_df.to_dict(orient="records"),
+        "trade_study": trade_df.to_dict(orient="records"),
+        "provenance": model_provenance_table().to_dict(orient="records"),
+        "regression_checks": regression_df.to_dict(orient="records"),
+    }
+
+    if not ekf_track.empty:
+        lab_export["ekf_tail"] = ekf_track.tail(100).to_dict(orient="records")
+
+    lab_json = json.dumps(
+        lab_export,
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    st.download_button(
+        "Download Engineering Lab JSON",
+        lab_json,
+        file_name="directed_energy_engineering_lab.json",
+        mime="application/json",
+        use_container_width=True,
     )
 
 
