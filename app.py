@@ -4811,7 +4811,7 @@ def layered_visibility_index(
     extinction = aerosol + humidity
 
     ds_km = max(slant_range_km, 0.0) / max(layers - 1, 1)
-    optical_depth = float(np.trapz(extinction, dx=ds_km))
+    optical_depth = float(np.trapezoid(extinction, dx=ds_km))
     return {
         "optical_depth": optical_depth,
         "visibility_index": clamp(math.exp(-optical_depth), 0.0, 1.0),
