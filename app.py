@@ -1,6 +1,11 @@
 import json
 import math
 import random
+import io
+import zipfile
+import urllib.request
+import urllib.error
+from datetime import datetime
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -6517,6 +6522,1607 @@ def model_validity_assessment(speed_mps, altitude_m, solver_dt_s, recommended_dt
         "overall": overall,
     }
 
+
+# ============================================================
+# Empirical validation helpers
+# ============================================================
+
+NASA_GTM_REPO_URL = "https://github.com/nasa/GTM_DesignSim"
+NASA_GTM_SOFTWARE_URL = "https://software.nasa.gov/software/LAR-17625-1"
+NOAA_IGRA_URL = (
+    "https://www.ncei.noaa.gov/products/weather-balloon/"
+    "integrated-global-radiosonde-archive"
+)
+NOAA_IGRA_DATA_BASE = "https://www.ncei.noaa.gov/pub/data/igra/data/data-por"
+
+
+def regression_error_metrics(
+    reference: np.ndarray,
+    model: np.ndarray,
+    circular_deg: bool = False,
+):
+    """
+    Formal residual/error metrics for empirical or reference-data comparisons.
+
+    Metrics:
+      bias, MAE, RMSE, max absolute error, normalized RMSE, and R^2.
+    """
+    ref = np.asarray(reference, dtype=float)
+    mod = np.asarray(model, dtype=float)
+
+    mask = np.isfinite(ref) & np.isfinite(mod)
+    ref = ref[mask]
+    mod = mod[mask]
+
+    if ref.size == 0:
+        return {
+            "N": 0,
+            "Bias": float("nan"),
+            "MAE": float("nan"),
+            "RMSE": float("nan"),
+            "Max Abs Error": float("nan"),
+            "NRMSE": float("nan"),
+            "R2": float("nan"),
+        }
+
+    if circular_deg:
+        # Circular-state validation:
+        # unwrap both histories before computing regression statistics so
+        # crossings at ±180° do not create artificial discontinuities.
+        ref_unwrapped = np.unwrap(
+            np.radians(ref)
+        )
+        mod_unwrapped = np.unwrap(
+            np.radians(mod)
+        )
+
+        # Align equivalent 2π branches using the first valid sample.
+        branch_shift = round(
+            (
+                ref_unwrapped[0]
+                - mod_unwrapped[0]
+            )
+            / (2.0 * math.pi)
+        )
+        mod_unwrapped = (
+            mod_unwrapped
+            + branch_shift
+            * 2.0
+            * math.pi
+        )
+
+        ref_for_stats = np.degrees(
+            ref_unwrapped
+        )
+        mod_for_stats = np.degrees(
+            mod_unwrapped
+        )
+        residual = (
+            mod_for_stats
+            - ref_for_stats
+        )
+    else:
+        ref_for_stats = ref
+        mod_for_stats = mod
+        residual = mod - ref
+
+    bias = float(np.mean(residual))
+    mae = float(np.mean(np.abs(residual)))
+    rmse = float(
+        math.sqrt(
+            np.mean(
+                residual**2
+            )
+        )
+    )
+    max_abs = float(
+        np.max(
+            np.abs(residual)
+        )
+    )
+
+    ref_span = float(
+        np.max(ref_for_stats)
+        - np.min(ref_for_stats)
+    )
+    if ref_span <= 1e-12:
+        ref_span = max(
+            float(
+                np.mean(
+                    np.abs(ref_for_stats)
+                )
+            ),
+            1e-12,
+        )
+    nrmse = rmse / ref_span
+
+    ss_res = float(
+        np.sum(
+            residual**2
+        )
+    )
+    ss_tot = float(
+        np.sum(
+            (
+                ref_for_stats
+                - np.mean(ref_for_stats)
+            )**2
+        )
+    )
+    r2 = (
+        1.0 - ss_res / ss_tot
+        if ss_tot > 1e-12
+        else float("nan")
+    )
+
+    return {
+        "N": int(ref.size),
+        "Bias": bias,
+        "MAE": mae,
+        "RMSE": rmse,
+        "Max Abs Error": max_abs,
+        "NRMSE": nrmse,
+        "R2": r2,
+    }
+
+
+def validation_metrics_table(
+    reference_df: pd.DataFrame,
+    model_df: pd.DataFrame,
+    mappings: dict,
+):
+    """
+    Compare named variables after time alignment/interpolation.
+
+    mappings:
+      output_label -> {
+        "reference": column,
+        "model": column,
+        "units": str,
+        "circular_deg": bool
+      }
+    """
+    rows = []
+
+    if (
+        "Time (s)" not in reference_df.columns
+        or "Time (s)" not in model_df.columns
+    ):
+        return pd.DataFrame()
+
+    ref = reference_df.sort_values(
+        "Time (s)"
+    ).copy()
+    mod = model_df.sort_values(
+        "Time (s)"
+    ).copy()
+
+    t_ref = ref[
+        "Time (s)"
+    ].to_numpy(
+        dtype=float
+    )
+    t_mod = mod[
+        "Time (s)"
+    ].to_numpy(
+        dtype=float
+    )
+
+    if (
+        t_ref.size == 0
+        or t_mod.size == 0
+    ):
+        return pd.DataFrame()
+
+    overlap_min = max(
+        float(np.min(t_ref)),
+        float(np.min(t_mod)),
+    )
+    overlap_max = min(
+        float(np.max(t_ref)),
+        float(np.max(t_mod)),
+    )
+
+    overlap_mask = (
+        (t_ref >= overlap_min)
+        & (t_ref <= overlap_max)
+    )
+
+    for label, spec in mappings.items():
+        ref_col = spec["reference"]
+        mod_col = spec["model"]
+
+        if (
+            ref_col not in ref.columns
+            or mod_col not in mod.columns
+        ):
+            continue
+
+        ref_values = ref[
+            ref_col
+        ].to_numpy(
+            dtype=float
+        )
+
+        model_values = np.interp(
+            t_ref,
+            t_mod,
+            mod[
+                mod_col
+            ].to_numpy(
+                dtype=float
+            ),
+        )
+
+        ref_overlap = ref_values[
+            overlap_mask
+        ]
+        model_overlap = model_values[
+            overlap_mask
+        ]
+
+        metrics = regression_error_metrics(
+            ref_overlap,
+            model_overlap,
+            circular_deg=spec.get(
+                "circular_deg",
+                False,
+            ),
+        )
+
+        rows.append(
+            {
+                "Variable": label,
+                "Units": spec.get(
+                    "units",
+                    "",
+                ),
+                **metrics,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _first_matching_column(
+    df: pd.DataFrame,
+    aliases: list[str],
+):
+    normalized = {
+        str(c).strip().lower(): c
+        for c in df.columns
+    }
+
+    for alias in aliases:
+        key = alias.strip().lower()
+        if key in normalized:
+            return normalized[key]
+
+    return None
+
+
+def canonicalize_nasa_gtm_csv(
+    uploaded_file,
+    velocity_units: str,
+    angular_rate_units: str,
+    attitude_units: str,
+    force_units: str = "N",
+    moment_units: str = "N·m",
+    altitude_units: str = "m",
+):
+    """
+    Convert an uploaded NASA GTM simulation export to the app's canonical
+    validation columns.
+
+    GTM's open example scripts commonly report body velocities in ft/s and
+    angular rates in rad/s internally, while plots may display deg/s.
+    The user explicitly chooses the export units used by their CSV.
+    """
+    df = pd.read_csv(
+        uploaded_file
+    )
+
+    aliases = {
+        "Time (s)": [
+            "time",
+            "time_s",
+            "time (s)",
+            "t",
+            "tsim",
+            "sec",
+            "seconds",
+        ],
+        "U body (m/s)": [
+            "u",
+            "u_body",
+            "u body",
+            "u (ft/sec)",
+            "u (m/s)",
+        ],
+        "V body (m/s)": [
+            "v",
+            "v_body",
+            "v body",
+            "v (ft/sec)",
+            "v (m/s)",
+        ],
+        "W body (m/s)": [
+            "w",
+            "w_body",
+            "w body",
+            "w (ft/sec)",
+            "w (m/s)",
+        ],
+        "p body rate (deg/s)": [
+            "p",
+            "p_rate",
+            "roll_rate",
+            "p (rad/s)",
+            "p (deg/s)",
+        ],
+        "q body rate (deg/s)": [
+            "q",
+            "q_rate",
+            "pitch_rate",
+            "q (rad/s)",
+            "q (deg/s)",
+        ],
+        "r body rate (deg/s)": [
+            "r",
+            "r_rate",
+            "yaw_rate",
+            "r (rad/s)",
+            "r (deg/s)",
+        ],
+        "Roll (deg)": [
+            "phi",
+            "roll",
+            "roll_deg",
+            "roll (deg)",
+        ],
+        "Pitch (deg)": [
+            "theta",
+            "pitch",
+            "pitch_deg",
+            "pitch (deg)",
+        ],
+        "Yaw (deg)": [
+            "psi",
+            "yaw",
+            "yaw_deg",
+            "yaw (deg)",
+        ],
+        "Altitude (m)": [
+            "altitude",
+            "alt",
+            "h",
+            "altitude_m",
+            "altitude (m)",
+            "altitude (ft)",
+        ],
+        "Fx body (N)": [
+            "fx",
+            "f_x",
+            "force_x",
+            "body_fx",
+            "fx_body",
+            "fx (n)",
+            "fx (lbf)",
+        ],
+        "Fy body (N)": [
+            "fy",
+            "f_y",
+            "force_y",
+            "body_fy",
+            "fy_body",
+            "fy (n)",
+            "fy (lbf)",
+        ],
+        "Fz body (N)": [
+            "fz",
+            "f_z",
+            "force_z",
+            "body_fz",
+            "fz_body",
+            "fz (n)",
+            "fz (lbf)",
+        ],
+        "L body moment (N·m)": [
+            "l",
+            "mx",
+            "roll_moment",
+            "body_l",
+            "l_moment",
+            "l (n*m)",
+            "l (lbf*ft)",
+        ],
+        "M body moment (N·m)": [
+            "m",
+            "my",
+            "pitch_moment",
+            "body_m",
+            "m_moment",
+            "m (n*m)",
+            "m (lbf*ft)",
+        ],
+        "N body moment (N·m)": [
+            "n",
+            "mz",
+            "yaw_moment",
+            "body_n",
+            "n_moment",
+            "n (n*m)",
+            "n (lbf*ft)",
+        ],
+    }
+
+    out = pd.DataFrame()
+
+    for canonical, names in aliases.items():
+        col = _first_matching_column(
+            df,
+            names,
+        )
+        if col is not None:
+            out[
+                canonical
+            ] = pd.to_numeric(
+                df[col],
+                errors="coerce",
+            )
+
+    if "Time (s)" not in out.columns:
+        raise ValueError(
+            "NASA GTM CSV requires a recognizable time column "
+            "(for example time, t, tsim, or Time (s))."
+        )
+
+    if velocity_units == "ft/s":
+        for col in [
+            "U body (m/s)",
+            "V body (m/s)",
+            "W body (m/s)",
+        ]:
+            if col in out.columns:
+                out[col] *= 0.3048
+
+    if angular_rate_units == "rad/s":
+        for col in [
+            "p body rate (deg/s)",
+            "q body rate (deg/s)",
+            "r body rate (deg/s)",
+        ]:
+            if col in out.columns:
+                out[col] = np.degrees(
+                    out[col]
+                )
+
+    if attitude_units == "rad":
+        for col in [
+            "Roll (deg)",
+            "Pitch (deg)",
+            "Yaw (deg)",
+        ]:
+            if col in out.columns:
+                out[col] = np.degrees(
+                    out[col]
+                )
+
+    if altitude_units == "ft" and "Altitude (m)" in out.columns:
+        out["Altitude (m)"] *= 0.3048
+
+    if force_units == "lbf":
+        for col in [
+            "Fx body (N)",
+            "Fy body (N)",
+            "Fz body (N)",
+        ]:
+            if col in out.columns:
+                out[col] *= 4.4482216152605
+
+    if moment_units == "lbf·ft":
+        for col in [
+            "L body moment (N·m)",
+            "M body moment (N·m)",
+            "N body moment (N·m)",
+        ]:
+            if col in out.columns:
+                out[col] *= 1.3558179483314
+
+    return out
+
+
+
+def nasa_gtm_matched_readiness(
+    gtm_df: pd.DataFrame,
+    excitation_mode: str,
+):
+    """
+    Check whether the uploaded reference contains the states required to
+    initialize a matched 6-DOF validation run.
+    """
+    required_states = [
+        "Time (s)",
+        "U body (m/s)",
+        "V body (m/s)",
+        "W body (m/s)",
+        "p body rate (deg/s)",
+        "q body rate (deg/s)",
+        "r body rate (deg/s)",
+        "Roll (deg)",
+        "Pitch (deg)",
+        "Yaw (deg)",
+    ]
+
+    missing = [
+        c
+        for c in required_states
+        if c not in gtm_df.columns
+    ]
+
+    force_moment_columns = [
+        "Fx body (N)",
+        "Fy body (N)",
+        "Fz body (N)",
+        "L body moment (N·m)",
+        "M body moment (N·m)",
+        "N body moment (N·m)",
+    ]
+
+    if excitation_mode == "Reference force/moment histories":
+        missing += [
+            c
+            for c in force_moment_columns
+            if c not in gtm_df.columns
+        ]
+
+    return {
+        "ready": len(missing) == 0,
+        "missing": sorted(
+            set(missing)
+        ),
+    }
+
+
+def simulate_matched_six_dof_gtm_case(
+    gtm_df: pd.DataFrame,
+    mass_kg: float,
+    inertia_kg_m2: np.ndarray,
+    excitation_mode: str,
+    constant_force_n: np.ndarray,
+    constant_moment_nm: np.ndarray,
+    initial_altitude_m: float,
+    reference_area_m2: float,
+    drag_coefficient: float,
+    rotational_damping_nm_per_rad_s: float,
+):
+    """
+    Run the generic 6-DOF rigid-body model on the exact NASA GTM reference
+    timestamps, initialized from the first valid GTM state.
+
+    This is the app's matched validation mode. It does not claim vehicle
+    equivalence unless the user supplies GTM-consistent mass/inertia and
+    equivalent force/moment excitations.
+    """
+    readiness = nasa_gtm_matched_readiness(
+        gtm_df,
+        excitation_mode,
+    )
+    if not readiness["ready"]:
+        raise ValueError(
+            "Matched GTM mode is missing required columns: "
+            + ", ".join(
+                readiness["missing"]
+            )
+        )
+
+    ref = (
+        gtm_df
+        .dropna(
+            subset=[
+                "Time (s)",
+                "U body (m/s)",
+                "V body (m/s)",
+                "W body (m/s)",
+                "p body rate (deg/s)",
+                "q body rate (deg/s)",
+                "r body rate (deg/s)",
+                "Roll (deg)",
+                "Pitch (deg)",
+                "Yaw (deg)",
+            ]
+        )
+        .sort_values(
+            "Time (s)"
+        )
+        .drop_duplicates(
+            subset=[
+                "Time (s)"
+            ],
+            keep="first",
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+    if len(ref) < 2:
+        raise ValueError(
+            "Matched GTM validation requires at least two valid reference samples."
+        )
+
+    times = ref[
+        "Time (s)"
+    ].to_numpy(
+        dtype=float
+    )
+    times = times - times[0]
+
+    initial = ref.iloc[0]
+
+    velocity_b = np.array(
+        [
+            float(initial["U body (m/s)"]),
+            float(initial["V body (m/s)"]),
+            float(initial["W body (m/s)"]),
+        ],
+        dtype=float,
+    )
+
+    omega_b = np.radians(
+        np.array(
+            [
+                float(initial["p body rate (deg/s)"]),
+                float(initial["q body rate (deg/s)"]),
+                float(initial["r body rate (deg/s)"]),
+            ],
+            dtype=float,
+        )
+    )
+
+    q_bi = quaternion_from_euler_deg(
+        float(initial["Roll (deg)"]),
+        float(initial["Pitch (deg)"]),
+        float(initial["Yaw (deg)"]),
+    )
+
+    altitude0 = (
+        float(initial["Altitude (m)"])
+        if (
+            "Altitude (m)" in ref.columns
+            and math.isfinite(
+                float(initial["Altitude (m)"])
+            )
+        )
+        else float(initial_altitude_m)
+    )
+
+    position_i = np.array(
+        [
+            0.0,
+            0.0,
+            altitude0,
+        ],
+        dtype=float,
+    )
+
+    mass = max(
+        float(mass_kg),
+        1e-6,
+    )
+    inertia = np.asarray(
+        inertia_kg_m2,
+        dtype=float,
+    )
+    if inertia.shape == (3,):
+        inertia = np.diag(
+            np.maximum(
+                inertia,
+                1e-9,
+            )
+        )
+    inertia_inv = np.linalg.inv(
+        inertia
+    )
+
+    g_i = np.array(
+        [
+            0.0,
+            0.0,
+            -9.80665,
+        ],
+        dtype=float,
+    )
+
+    constant_force_n = np.asarray(
+        constant_force_n,
+        dtype=float,
+    )
+    constant_moment_nm = np.asarray(
+        constant_moment_nm,
+        dtype=float,
+    )
+
+    rows = []
+
+    for k, tk in enumerate(times):
+        if k > 0:
+            dt = max(
+                float(
+                    times[k]
+                    - times[k - 1]
+                ),
+                0.0,
+            )
+
+            C_bi = quaternion_to_dcm_body_to_inertial(
+                q_bi
+            )
+            C_ib = C_bi.T
+
+            altitude_m = max(
+                float(
+                    position_i[2]
+                ),
+                0.0,
+            )
+            rho = standard_atmosphere_profile(
+                altitude_m
+            )["density_kg_m3"]
+
+            speed_b = float(
+                np.linalg.norm(
+                    velocity_b
+                )
+            )
+
+            drag_force_b = (
+                -0.5
+                * rho
+                * max(
+                    float(
+                        reference_area_m2
+                    ),
+                    0.0,
+                )
+                * max(
+                    float(
+                        drag_coefficient
+                    ),
+                    0.0,
+                )
+                * speed_b
+                * velocity_b
+            )
+
+            if excitation_mode == "Reference force/moment histories":
+                sample = ref.iloc[k]
+                command_force_b = np.array(
+                    [
+                        sample["Fx body (N)"],
+                        sample["Fy body (N)"],
+                        sample["Fz body (N)"],
+                    ],
+                    dtype=float,
+                )
+                command_moment_b = np.array(
+                    [
+                        sample["L body moment (N·m)"],
+                        sample["M body moment (N·m)"],
+                        sample["N body moment (N·m)"],
+                    ],
+                    dtype=float,
+                )
+            elif excitation_mode == "Zero external excitation":
+                command_force_b = np.zeros(
+                    3,
+                    dtype=float,
+                )
+                command_moment_b = np.zeros(
+                    3,
+                    dtype=float,
+                )
+            else:
+                command_force_b = constant_force_n
+                command_moment_b = constant_moment_nm
+
+            force_b = (
+                command_force_b
+                + drag_force_b
+            )
+
+            gravity_b = (
+                C_ib
+                @ g_i
+            )
+
+            velocity_dot_b = (
+                force_b
+                / mass
+                + gravity_b
+                - np.cross(
+                    omega_b,
+                    velocity_b,
+                )
+            )
+
+            moment_b = (
+                command_moment_b
+                - max(
+                    float(
+                        rotational_damping_nm_per_rad_s
+                    ),
+                    0.0,
+                )
+                * omega_b
+            )
+
+            omega_dot_b = (
+                inertia_inv
+                @ (
+                    moment_b
+                    - np.cross(
+                        omega_b,
+                        inertia
+                        @ omega_b,
+                    )
+                )
+            )
+
+            velocity_b = (
+                velocity_b
+                + velocity_dot_b
+                * dt
+            )
+            omega_b = (
+                omega_b
+                + omega_dot_b
+                * dt
+            )
+
+            omega_quat = np.array(
+                [
+                    0.0,
+                    omega_b[0],
+                    omega_b[1],
+                    omega_b[2],
+                ],
+                dtype=float,
+            )
+            q_dot = (
+                0.5
+                * quaternion_multiply(
+                    q_bi,
+                    omega_quat,
+                )
+            )
+            q_bi = quaternion_normalize(
+                q_bi
+                + q_dot
+                * dt
+            )
+
+            C_bi = quaternion_to_dcm_body_to_inertial(
+                q_bi
+            )
+            velocity_i = (
+                C_bi
+                @ velocity_b
+            )
+            position_i = (
+                position_i
+                + velocity_i
+                * dt
+            )
+
+        C_bi = quaternion_to_dcm_body_to_inertial(
+            q_bi
+        )
+        velocity_i = (
+            C_bi
+            @ velocity_b
+        )
+        roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_deg(
+            q_bi
+        )
+
+        rows.append(
+            {
+                "Time (s)": float(
+                    tk
+                ),
+                "X (m)": float(
+                    position_i[0]
+                ),
+                "Y (m)": float(
+                    position_i[1]
+                ),
+                "Z (m)": float(
+                    position_i[2]
+                ),
+                "VX (m/s)": float(
+                    velocity_i[0]
+                ),
+                "VY (m/s)": float(
+                    velocity_i[1]
+                ),
+                "VZ (m/s)": float(
+                    velocity_i[2]
+                ),
+                "U body (m/s)": float(
+                    velocity_b[0]
+                ),
+                "V body (m/s)": float(
+                    velocity_b[1]
+                ),
+                "W body (m/s)": float(
+                    velocity_b[2]
+                ),
+                "Roll (deg)": float(
+                    roll_deg
+                ),
+                "Pitch (deg)": float(
+                    pitch_deg
+                ),
+                "Yaw (deg)": float(
+                    yaw_deg
+                ),
+                "p body rate (deg/s)": float(
+                    math.degrees(
+                        omega_b[0]
+                    )
+                ),
+                "q body rate (deg/s)": float(
+                    math.degrees(
+                        omega_b[1]
+                    )
+                ),
+                "r body rate (deg/s)": float(
+                    math.degrees(
+                        omega_b[2]
+                    )
+                ),
+                "Quaternion Norm": float(
+                    np.linalg.norm(
+                        q_bi
+                    )
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+def nasa_gtm_validation_report(
+    gtm_df: pd.DataFrame,
+    six_dof_df: pd.DataFrame,
+):
+    mappings = {
+        "Body U": {
+            "reference": "U body (m/s)",
+            "model": "U body (m/s)",
+            "units": "m/s",
+        },
+        "Body V": {
+            "reference": "V body (m/s)",
+            "model": "V body (m/s)",
+            "units": "m/s",
+        },
+        "Body W": {
+            "reference": "W body (m/s)",
+            "model": "W body (m/s)",
+            "units": "m/s",
+        },
+        "Body p": {
+            "reference": "p body rate (deg/s)",
+            "model": "p body rate (deg/s)",
+            "units": "deg/s",
+        },
+        "Body q": {
+            "reference": "q body rate (deg/s)",
+            "model": "q body rate (deg/s)",
+            "units": "deg/s",
+        },
+        "Body r": {
+            "reference": "r body rate (deg/s)",
+            "model": "r body rate (deg/s)",
+            "units": "deg/s",
+        },
+        "Roll": {
+            "reference": "Roll (deg)",
+            "model": "Roll (deg)",
+            "units": "deg",
+            "circular_deg": True,
+        },
+        "Pitch": {
+            "reference": "Pitch (deg)",
+            "model": "Pitch (deg)",
+            "units": "deg",
+            "circular_deg": True,
+        },
+        "Yaw": {
+            "reference": "Yaw (deg)",
+            "model": "Yaw (deg)",
+            "units": "deg",
+            "circular_deg": True,
+        },
+    }
+
+    return validation_metrics_table(
+        gtm_df,
+        six_dof_df,
+        mappings,
+    )
+
+
+def parse_igra_station_text(
+    raw_text: str,
+):
+    """
+    Parse NOAA IGRA 2.x sounding data from the official fixed-width text format.
+
+    Column positions follow the public IGRA2 data format used by NOAA/NCEI.
+    Returns one dataframe containing all parsed levels plus sounding metadata.
+    """
+    rows = []
+    current = None
+
+    for line in raw_text.splitlines():
+        if not line:
+            continue
+
+        if line.startswith("#"):
+            try:
+                site_id = line[1:12].strip()
+                year = int(line[13:17])
+                month = int(line[18:20])
+                day = int(line[21:23])
+                hour = int(line[24:26])
+                num_levels = int(line[32:36])
+                lat_text = line[55:62].strip()
+                lon_text = line[63:71].strip()
+
+                def _latlon(v):
+                    if not v:
+                        return float("nan")
+                    sign = -1.0 if v.startswith("-") else 1.0
+                    v2 = v.lstrip("+-")
+                    if len(v2) < 5:
+                        return float(v)
+                    return sign * float(
+                        v2[:-4]
+                        + "."
+                        + v2[-4:]
+                    )
+
+                current = {
+                    "Station ID": site_id,
+                    "Sounding Time": datetime(
+                        year,
+                        month,
+                        day,
+                        max(hour, 0),
+                    ),
+                    "Number Levels": num_levels,
+                    "Latitude (deg)": _latlon(
+                        lat_text
+                    ),
+                    "Longitude (deg)": _latlon(
+                        lon_text
+                    ),
+                }
+            except Exception:
+                current = None
+
+            continue
+
+        if current is None:
+            continue
+
+        def _num(
+            a,
+            b,
+            scale=1.0,
+            missing=(
+                "-9999",
+                "-8888",
+                "-99999",
+                "",
+            ),
+        ):
+            value = line[
+                a:b
+            ].strip()
+
+            if value in missing:
+                return float("nan")
+
+            try:
+                return float(
+                    value
+                ) / scale
+            except Exception:
+                return float("nan")
+
+        rows.append(
+            {
+                **current,
+                "Pressure (hPa)": _num(
+                    9,
+                    15,
+                    scale=100.0,
+                ),
+                "Height (m)": _num(
+                    16,
+                    21,
+                ),
+                "Temperature (C)": _num(
+                    22,
+                    27,
+                    scale=10.0,
+                ),
+                "Relative Humidity (%)": _num(
+                    28,
+                    33,
+                    scale=10.0,
+                ),
+                "Dewpoint Depression (C)": _num(
+                    34,
+                    39,
+                    scale=10.0,
+                ),
+                "Wind Direction (deg)": _num(
+                    40,
+                    45,
+                ),
+                "Wind Speed (m/s)": _num(
+                    46,
+                    51,
+                    scale=10.0,
+                ),
+            }
+        )
+
+    return pd.DataFrame(
+        rows
+    )
+
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def fetch_noaa_igra_station(
+    station_id: str,
+):
+    """
+    Fetch the official NOAA/NCEI period-of-record IGRA station ZIP.
+    """
+    station = (
+        station_id
+        .strip()
+        .upper()
+    )
+
+    if len(station) != 11:
+        raise ValueError(
+            "IGRA station IDs contain 11 characters."
+        )
+
+    url = (
+        f"{NOAA_IGRA_DATA_BASE}/"
+        f"{station}-data.txt.zip"
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "DirectedEnergyDigitalTwin/"
+                "EmpiricalValidation"
+            )
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+        ) as response:
+            payload = response.read()
+    except urllib.error.HTTPError as exc:
+        raise ValueError(
+            f"NOAA IGRA station download failed "
+            f"(HTTP {exc.code})."
+        ) from exc
+    except Exception as exc:
+        raise ValueError(
+            "NOAA IGRA station download failed. "
+            "Check network access and station ID."
+        ) from exc
+
+    with zipfile.ZipFile(
+        io.BytesIO(payload)
+    ) as archive:
+        names = archive.namelist()
+        if not names:
+            raise ValueError(
+                "NOAA IGRA ZIP contained no files."
+            )
+        raw_text = archive.read(
+            names[0]
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    return parse_igra_station_text(
+        raw_text
+    )
+
+
+def select_nearest_igra_sounding(
+    station_df: pd.DataFrame,
+    requested_time: datetime,
+):
+    if station_df.empty:
+        return (
+            pd.DataFrame(),
+            None,
+        )
+
+    sounding_times = (
+        pd.to_datetime(
+            station_df[
+                "Sounding Time"
+            ]
+        )
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+
+    if sounding_times.empty:
+        return (
+            pd.DataFrame(),
+            None,
+        )
+
+    requested = pd.Timestamp(
+        requested_time
+    )
+
+    nearest_idx = int(
+        np.argmin(
+            np.abs(
+                sounding_times.to_numpy(
+                    dtype="datetime64[ns]"
+                )
+                - requested.to_datetime64()
+            )
+        )
+    )
+
+    selected_time = sounding_times.iloc[
+        nearest_idx
+    ]
+
+    sounding = station_df[
+        pd.to_datetime(
+            station_df[
+                "Sounding Time"
+            ]
+        )
+        == selected_time
+    ].copy()
+
+    return (
+        sounding.reset_index(
+            drop=True
+        ),
+        selected_time.to_pydatetime(),
+    )
+
+
+def noaa_radiosonde_validation(
+    sounding_df: pd.DataFrame,
+    surface_humidity_pct: float,
+):
+    """
+    Compare the app's low-order standard/profile atmosphere against a NOAA
+    radiosonde sounding at the observed geopotential heights.
+    """
+    obs = sounding_df.copy()
+
+    obs = obs[
+        np.isfinite(
+            pd.to_numeric(
+                obs[
+                    "Height (m)"
+                ],
+                errors="coerce",
+            )
+        )
+    ].copy()
+
+    if obs.empty:
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(),
+        )
+
+    obs[
+        "Height (m)"
+    ] = pd.to_numeric(
+        obs[
+            "Height (m)"
+        ],
+        errors="coerce",
+    )
+
+    # Empirical boundary condition for humidity:
+    # use the lowest valid observed radiosonde RH value, then evaluate the
+    # vertical decay model against the remaining observed levels.
+    valid_rh = obs[
+        np.isfinite(
+            pd.to_numeric(
+                obs[
+                    "Relative Humidity (%)"
+                ],
+                errors="coerce",
+            )
+        )
+    ].copy()
+
+    if not valid_rh.empty:
+        valid_rh = valid_rh.sort_values(
+            "Height (m)"
+        )
+        humidity_boundary_height_m = float(
+            valid_rh[
+                "Height (m)"
+            ].iloc[0]
+        )
+        humidity_boundary_rh_pct = clamp(
+            float(
+                valid_rh[
+                    "Relative Humidity (%)"
+                ].iloc[0]
+            ),
+            0.0,
+            100.0,
+        )
+    else:
+        humidity_boundary_height_m = float(
+            np.nanmin(
+                obs[
+                    "Height (m)"
+                ].to_numpy(
+                    dtype=float
+                )
+            )
+        )
+        humidity_boundary_rh_pct = clamp(
+            float(
+                surface_humidity_pct
+            ),
+            0.0,
+            100.0,
+        )
+
+    model_rows = []
+
+    for altitude in obs[
+        "Height (m)"
+    ].to_numpy(
+        dtype=float
+    ):
+        profile = standard_atmosphere_profile(
+            altitude
+        )
+
+        relative_height_m = max(
+            float(altitude)
+            - humidity_boundary_height_m,
+            0.0,
+        )
+
+        model_rows.append(
+            {
+                "Height (m)": altitude,
+                "Model Temperature (C)": (
+                    profile[
+                        "temperature_k"
+                    ]
+                    - 273.15
+                ),
+                "Model Pressure (hPa)": (
+                    profile[
+                        "pressure_pa"
+                    ]
+                    / 100.0
+                ),
+                "Model Density (kg/m³)": profile[
+                    "density_kg_m3"
+                ],
+                "Model Relative Humidity (%)": (
+                    humidity_boundary_rh_pct
+                    * math.exp(
+                        -relative_height_m
+                        / 2000.0
+                    )
+                ),
+                "Humidity Boundary Height (m)": humidity_boundary_height_m,
+                "Humidity Boundary RH (%)": humidity_boundary_rh_pct,
+            }
+        )
+
+    model = pd.DataFrame(
+        model_rows
+    )
+
+    obs[
+        "Observed Density (kg/m³)"
+    ] = (
+        obs[
+            "Pressure (hPa)"
+        ]
+        * 100.0
+        / (
+            287.05
+            * (
+                obs[
+                    "Temperature (C)"
+                ]
+                + 273.15
+            )
+        )
+    )
+
+    joined = pd.concat(
+        [
+            obs.reset_index(
+                drop=True
+            ),
+            model.drop(
+                columns=[
+                    "Height (m)"
+                ]
+            ).reset_index(
+                drop=True
+            ),
+        ],
+        axis=1,
+    )
+
+    mappings = {
+        "Temperature": (
+            "Temperature (C)",
+            "Model Temperature (C)",
+            "°C",
+        ),
+        "Pressure": (
+            "Pressure (hPa)",
+            "Model Pressure (hPa)",
+            "hPa",
+        ),
+        "Density": (
+            "Observed Density (kg/m³)",
+            "Model Density (kg/m³)",
+            "kg/m³",
+        ),
+        "Relative Humidity": (
+            "Relative Humidity (%)",
+            "Model Relative Humidity (%)",
+            "%",
+        ),
+    }
+
+    metric_rows = []
+
+    for label, (
+        ref_col,
+        mod_col,
+        units,
+    ) in mappings.items():
+        if (
+            ref_col not in joined.columns
+            or mod_col not in joined.columns
+        ):
+            continue
+
+        if label == "Relative Humidity":
+            # The lowest valid RH observation is the empirical boundary
+            # condition, so exclude that anchor point from validation residuals.
+            rh_eval = joined[
+                np.isfinite(
+                    joined[
+                        ref_col
+                    ].to_numpy(
+                        dtype=float
+                    )
+                )
+            ].sort_values(
+                "Height (m)"
+            )
+
+            if len(rh_eval) > 1:
+                rh_eval = rh_eval.iloc[
+                    1:
+                ]
+
+            metrics = regression_error_metrics(
+                rh_eval[
+                    ref_col
+                ].to_numpy(
+                    dtype=float
+                ),
+                rh_eval[
+                    mod_col
+                ].to_numpy(
+                    dtype=float
+                ),
+            )
+        else:
+            metrics = regression_error_metrics(
+                joined[
+                    ref_col
+                ].to_numpy(
+                    dtype=float
+                ),
+                joined[
+                    mod_col
+                ].to_numpy(
+                    dtype=float
+                ),
+            )
+
+        metric_rows.append(
+            {
+                "Variable": label,
+                "Units": units,
+                **metrics,
+            }
+        )
+
+    return (
+        joined,
+        pd.DataFrame(
+            metric_rows
+        ),
+    )
+
+
+def validation_provenance_table():
+    return pd.DataFrame(
+        [
+            {
+                "Reference": "NASA Generic Transport Model (GTM_DesignSim)",
+                "Provider": "NASA Langley Research Center",
+                "Role": "6-DOF flight-dynamics reference comparison",
+                "Source": NASA_GTM_REPO_URL,
+                "Evidence type": "Independent nonlinear reference simulation",
+            },
+            {
+                "Reference": "NASA Software Catalog LAR-17625-1",
+                "Provider": "NASA",
+                "Role": "GTM model provenance",
+                "Source": NASA_GTM_SOFTWARE_URL,
+                "Evidence type": "Official software description",
+            },
+            {
+                "Reference": "Integrated Global Radiosonde Archive (IGRA 2.2)",
+                "Provider": "NOAA/NCEI",
+                "Role": "Observed atmospheric-profile validation",
+                "Source": NOAA_IGRA_URL,
+                "Evidence type": "Quality-controlled observations",
+            },
+        ]
+    )
+
+
 # ============================================================
 # UI
 # ============================================================
@@ -7219,7 +8825,7 @@ else:
     st.error(result["Recommendation"])
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
     [
         "Engagement Loop",
         "State Estimation",
@@ -7230,6 +8836,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
         "Export",
         "Advanced Twin / V&V",
         "Engineering Lab",
+        "Empirical Validation",
     ]
 )
 
@@ -9438,6 +11045,907 @@ with tab9:
         width="stretch",
     )
 
+
+
+# ============================================================
+# Empirical Validation Lab
+# ============================================================
+
+with tab10:
+    st.markdown("### Empirical Validation Lab")
+    st.caption(
+        "Compare the generic aerospace models against independent public reference "
+        "data. NASA GTM comparison requires a CSV exported from GTM_DesignSim or a "
+        "derived GTM reference run. NOAA IGRA observations can be retrieved directly "
+        "from NCEI by station ID. Validation applies only to the variables, regimes, "
+        "and cases actually compared."
+    )
+
+    st.markdown("#### Validation Provenance")
+    st.dataframe(
+        validation_provenance_table(),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Source": st.column_config.LinkColumn(
+                "Source"
+            )
+        },
+    )
+
+    st.markdown("#### NASA Generic Transport Model Comparison")
+    st.caption(
+        "NASA's GTM_DesignSim is an independent nonlinear transport-aircraft flight-"
+        "dynamics simulation. To avoid falsely claiming validation, this app does not "
+        "ship synthetic GTM results as empirical evidence. Upload a CSV exported from "
+        "an actual GTM run. The comparison interpolates the current generic 6-DOF truth "
+        "onto the NASA reference timestamps and reports formal residual statistics."
+    )
+
+    gtm_source_c1, gtm_source_c2 = st.columns(2)
+    with gtm_source_c1:
+        st.link_button(
+            "NASA GTM_DesignSim repository",
+            NASA_GTM_REPO_URL,
+            width="stretch",
+        )
+    with gtm_source_c2:
+        st.link_button(
+            "NASA Software Catalog entry",
+            NASA_GTM_SOFTWARE_URL,
+            width="stretch",
+        )
+
+    gtm_upload = st.file_uploader(
+        "Upload NASA GTM reference CSV",
+        type=["csv"],
+        key="gtm_reference_upload",
+        help=(
+            "Recognized aliases include time/t/tsim; u/v/w; p/q/r; "
+            "phi/theta/psi or roll/pitch/yaw."
+        ),
+    )
+
+    gtm_u1, gtm_u2, gtm_u3 = st.columns(3)
+    with gtm_u1:
+        gtm_velocity_units = st.selectbox(
+            "GTM velocity units",
+            ["ft/s", "m/s"],
+            key="gtm_velocity_units",
+        )
+    with gtm_u2:
+        gtm_rate_units = st.selectbox(
+            "GTM angular-rate units",
+            ["rad/s", "deg/s"],
+            key="gtm_rate_units",
+        )
+    with gtm_u3:
+        gtm_attitude_units = st.selectbox(
+            "GTM attitude units",
+            ["rad", "deg"],
+            key="gtm_attitude_units",
+        )
+
+    gtm_extra1, gtm_extra2, gtm_extra3 = st.columns(3)
+    with gtm_extra1:
+        gtm_force_units = st.selectbox(
+            "GTM force units",
+            ["N", "lbf"],
+            key="gtm_force_units",
+        )
+    with gtm_extra2:
+        gtm_moment_units = st.selectbox(
+            "GTM moment units",
+            ["N·m", "lbf·ft"],
+            key="gtm_moment_units",
+        )
+    with gtm_extra3:
+        gtm_altitude_units = st.selectbox(
+            "GTM altitude units",
+            ["m", "ft"],
+            key="gtm_altitude_units",
+        )
+
+    gtm_validation_mode = st.radio(
+        "NASA GTM validation mode",
+        [
+            "Matched validation",
+            "Comparative overlay only",
+        ],
+        horizontal=True,
+        key="gtm_validation_mode",
+        help=(
+            "Matched validation initializes the generic 6-DOF model from the "
+            "first NASA GTM state, uses the exact GTM timestamp grid, and requires "
+            "GTM-consistent mass/inertia and equivalent excitation assumptions."
+        ),
+    )
+
+    if gtm_upload is not None:
+        try:
+            gtm_reference = canonicalize_nasa_gtm_csv(
+                gtm_upload,
+                velocity_units=gtm_velocity_units,
+                angular_rate_units=gtm_rate_units,
+                attitude_units=gtm_attitude_units,
+                force_units=gtm_force_units,
+                moment_units=gtm_moment_units,
+                altitude_units=gtm_altitude_units,
+            )
+
+            if gtm_validation_mode == "Matched validation":
+                st.markdown("##### Matched GTM Case Definition")
+
+                mg1, mg2, mg3, mg4 = st.columns(4)
+                with mg1:
+                    matched_mass_units = st.selectbox(
+                        "Mass units",
+                        ["kg", "slug"],
+                        key="matched_mass_units",
+                    )
+                    matched_mass_input = st.number_input(
+                        "Matched GTM mass",
+                        min_value=0.01,
+                        max_value=1_000_000.0,
+                        value=500.0,
+                        step=1.0,
+                        key="matched_gtm_mass",
+                    )
+                with mg2:
+                    matched_inertia_units = st.selectbox(
+                        "Inertia units",
+                        ["kg·m²", "slug·ft²"],
+                        key="matched_inertia_units",
+                    )
+                    matched_ixx_input = st.number_input(
+                        "Matched Ixx",
+                        min_value=0.001,
+                        max_value=100_000_000.0,
+                        value=900.0,
+                        step=1.0,
+                        key="matched_gtm_ixx",
+                    )
+                with mg3:
+                    matched_iyy_input = st.number_input(
+                        "Matched Iyy",
+                        min_value=0.001,
+                        max_value=100_000_000.0,
+                        value=1200.0,
+                        step=1.0,
+                        key="matched_gtm_iyy",
+                    )
+                    matched_izz_input = st.number_input(
+                        "Matched Izz",
+                        min_value=0.001,
+                        max_value=100_000_000.0,
+                        value=1500.0,
+                        step=1.0,
+                        key="matched_gtm_izz",
+                    )
+                with mg4:
+                    matched_initial_altitude_m = st.number_input(
+                        "Initial altitude fallback (m)",
+                        min_value=0.0,
+                        max_value=100000.0,
+                        value=float(
+                            max(
+                                tgt.initial_altitude_m,
+                                0.0,
+                            )
+                        ),
+                        step=10.0,
+                        key="matched_gtm_altitude",
+                        help=(
+                            "Used only when the uploaded GTM CSV does not contain "
+                            "a recognizable altitude column."
+                        ),
+                    )
+
+                mass_conversion = (
+                    14.593902937206
+                    if matched_mass_units == "slug"
+                    else 1.0
+                )
+                inertia_conversion = (
+                    1.3558179483314
+                    if matched_inertia_units == "slug·ft²"
+                    else 1.0
+                )
+
+                matched_mass_kg = (
+                    float(matched_mass_input)
+                    * mass_conversion
+                )
+                matched_inertia_kg_m2 = np.array(
+                    [
+                        matched_ixx_input,
+                        matched_iyy_input,
+                        matched_izz_input,
+                    ],
+                    dtype=float,
+                ) * inertia_conversion
+
+                matched_excitation_mode = st.selectbox(
+                    "Equivalent excitation source",
+                    [
+                        "Reference force/moment histories",
+                        "Constant equivalent force/moment",
+                        "Zero external excitation",
+                    ],
+                    key="matched_gtm_excitation_mode",
+                    help=(
+                        "For a defensible matched case, use GTM-consistent body "
+                        "force/moment histories when available. Constant or zero "
+                        "excitation modes are appropriate only for reference cases "
+                        "constructed with those same assumptions."
+                    ),
+                )
+
+                mf1, mf2, mf3 = st.columns(3)
+                with mf1:
+                    matched_fx = st.number_input(
+                        "Equivalent Fx (N)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_fx",
+                    )
+                    matched_l = st.number_input(
+                        "Equivalent L (N·m)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_l",
+                    )
+                with mf2:
+                    matched_fy = st.number_input(
+                        "Equivalent Fy (N)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_fy",
+                    )
+                    matched_m = st.number_input(
+                        "Equivalent M (N·m)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_m",
+                    )
+                with mf3:
+                    matched_fz = st.number_input(
+                        "Equivalent Fz (N)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_fz",
+                    )
+                    matched_n = st.number_input(
+                        "Equivalent N (N·m)",
+                        value=0.0,
+                        step=10.0,
+                        key="matched_n",
+                    )
+
+                ma1, ma2, ma3 = st.columns(3)
+                with ma1:
+                    matched_reference_area = st.number_input(
+                        "Matched reference area (m²)",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=2.0,
+                        step=0.1,
+                        key="matched_reference_area",
+                    )
+                with ma2:
+                    matched_cd = st.number_input(
+                        "Matched generic drag coefficient",
+                        min_value=0.0,
+                        max_value=5.0,
+                        value=0.15,
+                        step=0.01,
+                        key="matched_cd",
+                    )
+                with ma3:
+                    matched_rot_damping = st.number_input(
+                        "Matched rotational damping (N·m per rad/s)",
+                        min_value=0.0,
+                        max_value=1_000_000.0,
+                        value=0.0,
+                        step=1.0,
+                        key="matched_rot_damping",
+                    )
+
+                matched_mass_confirm = st.checkbox(
+                    "I confirm these mass/inertia values correspond to the NASA GTM reference case.",
+                    key="matched_mass_confirm",
+                )
+                matched_excitation_confirm = st.checkbox(
+                    "I confirm the selected force/moment excitation is equivalent to the NASA GTM reference case.",
+                    key="matched_excitation_confirm",
+                )
+
+                readiness = nasa_gtm_matched_readiness(
+                    gtm_reference,
+                    matched_excitation_mode,
+                )
+
+                if readiness["missing"]:
+                    st.warning(
+                        "Matched case is missing required reference columns: "
+                        + ", ".join(
+                            readiness["missing"]
+                        )
+                    )
+
+                matched_case_ready = bool(
+                    readiness["ready"]
+                    and matched_mass_confirm
+                    and matched_excitation_confirm
+                )
+
+                st.metric(
+                    "Matched Validation Readiness",
+                    (
+                        "READY"
+                        if matched_case_ready
+                        else "INCOMPLETE"
+                    ),
+                )
+
+                if matched_case_ready:
+                    gtm_model_for_validation = simulate_matched_six_dof_gtm_case(
+                        gtm_reference,
+                        mass_kg=matched_mass_kg,
+                        inertia_kg_m2=matched_inertia_kg_m2,
+                        excitation_mode=matched_excitation_mode,
+                        constant_force_n=np.array(
+                            [
+                                matched_fx,
+                                matched_fy,
+                                matched_fz,
+                            ],
+                            dtype=float,
+                        ),
+                        constant_moment_nm=np.array(
+                            [
+                                matched_l,
+                                matched_m,
+                                matched_n,
+                            ],
+                            dtype=float,
+                        ),
+                        initial_altitude_m=matched_initial_altitude_m,
+                        reference_area_m2=matched_reference_area,
+                        drag_coefficient=matched_cd,
+                        rotational_damping_nm_per_rad_s=matched_rot_damping,
+                    )
+
+                    gtm_report = nasa_gtm_validation_report(
+                        gtm_reference,
+                        gtm_model_for_validation,
+                    )
+                    gtm_report["Validation Mode"] = "Matched"
+                else:
+                    gtm_model_for_validation = six_dof_truth
+                    gtm_report = pd.DataFrame()
+            else:
+                gtm_model_for_validation = six_dof_truth
+                gtm_report = nasa_gtm_validation_report(
+                    gtm_reference,
+                    gtm_model_for_validation,
+                )
+                if not gtm_report.empty:
+                    gtm_report["Validation Mode"] = "Comparative only"
+
+            st.markdown(
+                "##### NASA GTM Matched Validation Residuals"
+                if gtm_validation_mode == "Matched validation"
+                else "##### NASA GTM Comparative Residual / Error Report"
+            )
+            if gtm_report.empty:
+                st.warning(
+                    "The uploaded CSV contained a time column but none of the "
+                    "recognized state variables needed for comparison."
+                )
+            else:
+                st.dataframe(
+                    gtm_report,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "NRMSE": st.column_config.NumberColumn(
+                            "NRMSE",
+                            format="%.4f",
+                        ),
+                        "R2": st.column_config.NumberColumn(
+                            "R²",
+                            format="%.4f",
+                        ),
+                    },
+                )
+
+                gtm_metric_cols = st.columns(4)
+                gtm_metric_cols[0].metric(
+                    "Variables Compared",
+                    f"{len(gtm_report)}",
+                )
+                gtm_metric_cols[1].metric(
+                    "Median NRMSE",
+                    (
+                        f"{gtm_report['NRMSE'].median():.3f}"
+                        if np.isfinite(
+                            gtm_report["NRMSE"]
+                        ).any()
+                        else "N/A"
+                    ),
+                )
+                gtm_metric_cols[2].metric(
+                    "Median R²",
+                    (
+                        f"{gtm_report['R2'].median():.3f}"
+                        if np.isfinite(
+                            gtm_report["R2"]
+                        ).any()
+                        else "N/A"
+                    ),
+                )
+                gtm_metric_cols[3].metric(
+                    "Reference Samples",
+                    f"{len(gtm_reference)}",
+                )
+
+                gtm_compare_options = [
+                    c
+                    for c in [
+                        "U body (m/s)",
+                        "V body (m/s)",
+                        "W body (m/s)",
+                        "p body rate (deg/s)",
+                        "q body rate (deg/s)",
+                        "r body rate (deg/s)",
+                        "Roll (deg)",
+                        "Pitch (deg)",
+                        "Yaw (deg)",
+                    ]
+                    if (
+                        c in gtm_reference.columns
+                        and c in gtm_model_for_validation.columns
+                    )
+                ]
+
+                if gtm_compare_options:
+                    gtm_plot_var = st.selectbox(
+                        "NASA GTM comparison variable",
+                        gtm_compare_options,
+                        key="gtm_plot_variable",
+                    )
+
+                    reference_plot = gtm_reference[
+                        [
+                            "Time (s)",
+                            gtm_plot_var,
+                        ]
+                    ].dropna()
+
+                    model_interp = np.interp(
+                        reference_plot[
+                            "Time (s)"
+                        ].to_numpy(
+                            dtype=float
+                        ),
+                        gtm_model_for_validation[
+                            "Time (s)"
+                        ].to_numpy(
+                            dtype=float
+                        ),
+                        gtm_model_for_validation[
+                            gtm_plot_var
+                        ].to_numpy(
+                            dtype=float
+                        ),
+                    )
+
+                    compare_df = pd.DataFrame(
+                        {
+                            "Time (s)": reference_plot[
+                                "Time (s)"
+                            ].to_numpy(
+                                dtype=float
+                            ),
+                            "NASA GTM Reference": reference_plot[
+                                gtm_plot_var
+                            ].to_numpy(
+                                dtype=float
+                            ),
+                            (
+                                "Matched 6-DOF Model"
+                                if gtm_validation_mode == "Matched validation"
+                                else "Current 6-DOF Model"
+                            ): model_interp,
+                        }
+                    )
+
+                    st.line_chart(
+                        compare_df.set_index(
+                            "Time (s)"
+                        ),
+                        width="stretch",
+                    )
+
+                gtm_csv = gtm_report.to_csv(
+                    index=False
+                ).encode(
+                    "utf-8"
+                )
+                st.download_button(
+                    "Download NASA GTM Validation Metrics CSV",
+                    gtm_csv,
+                    file_name="nasa_gtm_validation_metrics.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+            st.caption(
+                "Interpretation: low residuals only support the conditions represented "
+                "by the uploaded GTM case. A poor match can reflect different vehicle "
+                "parameters, aerodynamic models, control inputs, trim states, or units, "
+                "not necessarily an integration error."
+            )
+
+        except Exception as exc:
+            st.error(
+                f"NASA GTM comparison could not be completed: {exc}"
+            )
+
+    st.markdown("#### NOAA/NCEI Radiosonde Validation")
+    st.caption(
+        "NOAA IGRA 2.2 contains quality-controlled upper-air observations. "
+        "Enter an 11-character IGRA station identifier and select a requested UTC "
+        "date/time. The app retrieves the official period-of-record station archive, "
+        "selects the nearest sounding, and compares observed vertical profiles against "
+        "the current low-order atmosphere."
+    )
+
+    noaa_link_c1, noaa_link_c2 = st.columns(2)
+    with noaa_link_c1:
+        st.link_button(
+            "NOAA IGRA dataset",
+            NOAA_IGRA_URL,
+            width="stretch",
+        )
+    with noaa_link_c2:
+        st.link_button(
+            "NOAA IGRA station list",
+            "https://www.ncei.noaa.gov/pub/data/igra/igra2-station-list.txt",
+            width="stretch",
+        )
+
+    n1, n2, n3 = st.columns(3)
+    with n1:
+        igra_station_id = st.text_input(
+            "IGRA station ID",
+            value="USM00072210",
+            max_chars=11,
+            key="igra_station_id",
+            help=(
+                "Example: USM00072210. Use NOAA's station list to choose a station."
+            ),
+        )
+    with n2:
+        igra_date = st.date_input(
+            "Requested sounding date (UTC)",
+            value=datetime.utcnow().date(),
+            key="igra_date",
+        )
+    with n3:
+        igra_hour = st.selectbox(
+            "Requested UTC hour",
+            [0, 6, 12, 18],
+            index=2,
+            key="igra_hour",
+        )
+
+    if st.button(
+        "Fetch NOAA IGRA Sounding",
+        key="fetch_igra_sounding",
+        width="stretch",
+    ):
+        try:
+            station_df = fetch_noaa_igra_station(
+                igra_station_id
+            )
+            requested_dt = datetime(
+                igra_date.year,
+                igra_date.month,
+                igra_date.day,
+                int(igra_hour),
+            )
+            sounding_df, selected_time = select_nearest_igra_sounding(
+                station_df,
+                requested_dt,
+            )
+
+            st.session_state[
+                "igra_selected_sounding"
+            ] = sounding_df
+            st.session_state[
+                "igra_selected_time"
+            ] = selected_time
+            st.session_state[
+                "igra_selected_station"
+            ] = igra_station_id.strip().upper()
+
+        except Exception as exc:
+            st.error(
+                f"NOAA IGRA retrieval failed: {exc}"
+            )
+
+    selected_sounding = st.session_state.get(
+        "igra_selected_sounding"
+    )
+    selected_time = st.session_state.get(
+        "igra_selected_time"
+    )
+    selected_station = st.session_state.get(
+        "igra_selected_station"
+    )
+
+    if isinstance(
+        selected_sounding,
+        pd.DataFrame,
+    ) and not selected_sounding.empty:
+        noaa_joined, noaa_metrics = noaa_radiosonde_validation(
+            selected_sounding,
+            env.humidity_pct,
+        )
+
+        st.success(
+            f"Loaded NOAA IGRA sounding: {selected_station} at "
+            f"{selected_time:%Y-%m-%d %H:%M UTC}"
+        )
+
+        if (
+            "Humidity Boundary RH (%)" in noaa_joined.columns
+            and "Humidity Boundary Height (m)" in noaa_joined.columns
+        ):
+            st.caption(
+                "Humidity validation boundary condition: "
+                f"{noaa_joined['Humidity Boundary RH (%)'].iloc[0]:.1f}% RH "
+                f"at {noaa_joined['Humidity Boundary Height (m)'].iloc[0]:.0f} m. "
+                "That anchor observation is excluded from the humidity residual statistics; "
+                "the remaining sounding levels test the vertical humidity model."
+            )
+
+        noaa_summary = st.columns(4)
+        noaa_summary[0].metric(
+            "Observed Levels",
+            f"{len(selected_sounding)}",
+        )
+        noaa_summary[1].metric(
+            "Lowest Height",
+            (
+                f"{selected_sounding['Height (m)'].min():.0f} m"
+                if np.isfinite(
+                    selected_sounding[
+                        "Height (m)"
+                    ]
+                ).any()
+                else "N/A"
+            ),
+        )
+        noaa_summary[2].metric(
+            "Highest Height",
+            (
+                f"{selected_sounding['Height (m)'].max():.0f} m"
+                if np.isfinite(
+                    selected_sounding[
+                        "Height (m)"
+                    ]
+                ).any()
+                else "N/A"
+            ),
+        )
+        noaa_summary[3].metric(
+            "Profile Variables",
+            f"{len(noaa_metrics)}",
+        )
+
+        st.markdown("##### NOAA Atmospheric Residual / Error Report")
+        st.dataframe(
+            noaa_metrics,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "NRMSE": st.column_config.NumberColumn(
+                    "NRMSE",
+                    format="%.4f",
+                ),
+                "R2": st.column_config.NumberColumn(
+                    "R²",
+                    format="%.4f",
+                ),
+            },
+        )
+
+        atmosphere_plot_variable = st.selectbox(
+            "Atmospheric validation variable",
+            [
+                "Temperature",
+                "Pressure",
+                "Density",
+                "Relative Humidity",
+            ],
+            key="atmosphere_validation_variable",
+        )
+
+        atmosphere_columns = {
+            "Temperature": (
+                "Temperature (C)",
+                "Model Temperature (C)",
+            ),
+            "Pressure": (
+                "Pressure (hPa)",
+                "Model Pressure (hPa)",
+            ),
+            "Density": (
+                "Observed Density (kg/m³)",
+                "Model Density (kg/m³)",
+            ),
+            "Relative Humidity": (
+                "Relative Humidity (%)",
+                "Model Relative Humidity (%)",
+            ),
+        }
+
+        observed_col, model_col = atmosphere_columns[
+            atmosphere_plot_variable
+        ]
+
+        profile_plot = go.Figure()
+        profile_plot.add_trace(
+            go.Scatter(
+                x=noaa_joined[
+                    observed_col
+                ],
+                y=noaa_joined[
+                    "Height (m)"
+                ],
+                mode="lines+markers",
+                name="NOAA IGRA Observation",
+            )
+        )
+        profile_plot.add_trace(
+            go.Scatter(
+                x=noaa_joined[
+                    model_col
+                ],
+                y=noaa_joined[
+                    "Height (m)"
+                ],
+                mode="lines",
+                name="Current Atmosphere Model",
+            )
+        )
+        profile_plot.update_layout(
+            height=520,
+            xaxis_title=atmosphere_plot_variable,
+            yaxis_title="Geopotential Height (m)",
+            title=(
+                f"NOAA IGRA vs Model: "
+                f"{atmosphere_plot_variable}"
+            ),
+            margin=dict(
+                l=50,
+                r=20,
+                t=55,
+                b=45,
+            ),
+        )
+        st.plotly_chart(
+            profile_plot,
+            width="stretch",
+            config={
+                "responsive": True,
+                "displaylogo": False,
+            },
+        )
+
+        noaa_metric_csv = noaa_metrics.to_csv(
+            index=False
+        ).encode(
+            "utf-8"
+        )
+        st.download_button(
+            "Download NOAA Atmospheric Validation Metrics CSV",
+            noaa_metric_csv,
+            file_name="noaa_igra_validation_metrics.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+        noaa_profile_csv = noaa_joined.to_csv(
+            index=False
+        ).encode(
+            "utf-8"
+        )
+        st.download_button(
+            "Download NOAA Observation/Model Profile CSV",
+            noaa_profile_csv,
+            file_name="noaa_igra_observation_model_profile.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+        st.caption(
+            "NOAA comparison is observational validation of the atmosphere only. "
+            "The radiosonde does not validate optical transmission directly. "
+            "Humidity instrumentation, station changes, missing values, and the "
+            "difference between geopotential and geometric altitude remain sources "
+            "of uncertainty."
+        )
+
+    st.markdown("#### Formal Validation Record")
+    validation_record = {
+        "generated_utc": datetime.utcnow().isoformat() + "Z",
+        "application_model": "Directed Energy Engagement Digital Twin",
+        "validation_scope": {
+            "NASA_GTM": (
+                "Matched or comparative 6-DOF state comparison from user-supplied independent GTM run"
+            ),
+            "NOAA_IGRA": (
+                "Observed atmospheric-profile comparison"
+            ),
+        },
+        "sources": validation_provenance_table().to_dict(
+            orient="records"
+        ),
+        "limitations": [
+            "Validation applies only to the compared regimes and variables.",
+            "NASA GTM comparison does not imply the generic vehicle equals the GTM aircraft.",
+            "NOAA radiosonde comparison does not validate directed-energy optical effects.",
+            "No lethality or probability-of-kill validation is claimed.",
+        ],
+    }
+
+    if (
+        "gtm_report" in locals()
+        and isinstance(
+            gtm_report,
+            pd.DataFrame,
+        )
+        and not gtm_report.empty
+    ):
+        validation_record[
+            "NASA_GTM_metrics"
+        ] = gtm_report.to_dict(
+            orient="records"
+        )
+
+    if (
+        "noaa_metrics" in locals()
+        and isinstance(
+            noaa_metrics,
+            pd.DataFrame,
+        )
+        and not noaa_metrics.empty
+    ):
+        validation_record[
+            "NOAA_IGRA_metrics"
+        ] = noaa_metrics.to_dict(
+            orient="records"
+        )
+
+    validation_json = json.dumps(
+        validation_record,
+        indent=2,
+        default=str,
+    ).encode(
+        "utf-8"
+    )
+
+    st.download_button(
+        "Download Formal Validation Record JSON",
+        validation_json,
+        file_name="empirical_validation_record.json",
+        mime="application/json",
+        width="stretch",
+    )
 
 st.divider()
 
