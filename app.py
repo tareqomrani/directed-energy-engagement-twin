@@ -4813,6 +4813,472 @@ def generic_point_mass_flight_dynamics(
     return pd.DataFrame(rows)
 
 
+def quaternion_normalize(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=float)
+    norm = max(float(np.linalg.norm(q)), 1e-12)
+    return q / norm
+
+
+def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product for quaternions stored as [w, x, y, z]."""
+    w1, x1, y1, z1 = np.asarray(q1, dtype=float)
+    w2, x2, y2, z2 = np.asarray(q2, dtype=float)
+
+    return np.array(
+        [
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        ],
+        dtype=float,
+    )
+
+
+def quaternion_from_euler_deg(
+    roll_deg: float,
+    pitch_deg: float,
+    yaw_deg: float,
+) -> np.ndarray:
+    """
+    3-2-1 yaw-pitch-roll attitude quaternion, body-to-inertial.
+    """
+    phi = math.radians(float(roll_deg))
+    theta = math.radians(float(pitch_deg))
+    psi = math.radians(float(yaw_deg))
+
+    cr = math.cos(phi / 2.0)
+    sr = math.sin(phi / 2.0)
+    cp = math.cos(theta / 2.0)
+    sp = math.sin(theta / 2.0)
+    cy = math.cos(psi / 2.0)
+    sy = math.sin(psi / 2.0)
+
+    return quaternion_normalize(
+        np.array(
+            [
+                cr*cp*cy + sr*sp*sy,
+                sr*cp*cy - cr*sp*sy,
+                cr*sp*cy + sr*cp*sy,
+                cr*cp*sy - sr*sp*cy,
+            ],
+            dtype=float,
+        )
+    )
+
+
+def quaternion_to_dcm_body_to_inertial(q: np.ndarray) -> np.ndarray:
+    """
+    Direction-cosine matrix mapping body-frame vectors into the
+    inertial x/y/z-up visualization frame.
+    """
+    w, x, y, z = quaternion_normalize(q)
+
+    return np.array(
+        [
+            [1.0 - 2.0*(y*y + z*z), 2.0*(x*y - z*w),       2.0*(x*z + y*w)],
+            [2.0*(x*y + z*w),       1.0 - 2.0*(x*x + z*z), 2.0*(y*z - x*w)],
+            [2.0*(x*z - y*w),       2.0*(y*z + x*w),       1.0 - 2.0*(x*x + y*y)],
+        ],
+        dtype=float,
+    )
+
+
+def quaternion_to_euler_deg(q: np.ndarray):
+    """
+    Return roll, pitch, yaw in degrees for display only.
+    Quaternion state remains authoritative internally.
+    """
+    w, x, y, z = quaternion_normalize(q)
+
+    sinr_cosp = 2.0 * (w*x + y*z)
+    cosr_cosp = 1.0 - 2.0 * (x*x + y*y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = clamp(
+        2.0 * (w*y - z*x),
+        -1.0,
+        1.0,
+    )
+    pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w*z + x*y)
+    cosy_cosp = 1.0 - 2.0 * (y*y + z*z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return (
+        math.degrees(roll),
+        math.degrees(pitch),
+        math.degrees(yaw),
+    )
+
+
+def generic_six_dof_rigid_body(
+    initial_position_m: np.ndarray,
+    initial_velocity_inertial_mps: np.ndarray,
+    initial_roll_deg: float,
+    initial_pitch_deg: float,
+    initial_yaw_deg: float,
+    initial_body_rates_deg_s: np.ndarray,
+    duration_s: float,
+    dt_s: float,
+    mass_kg: float,
+    inertia_kg_m2: np.ndarray,
+    body_force_command_n: np.ndarray,
+    body_moment_command_nm: np.ndarray,
+    reference_area_m2: float,
+    drag_coefficient: float,
+    rotational_damping_nm_per_rad_s: float = 0.0,
+):
+    """
+    Generic non-operational 6-DOF rigid-body aerospace model.
+
+    State:
+      inertial position [x, y, z]
+      body velocity [u, v, w]
+      body angular rate [p, q, r]
+      attitude quaternion [q0, q1, q2, q3]
+
+    Equations:
+      r_dot_i = C_bi * V_b
+      V_dot_b = F_b/m + C_ib*g_i - omega_b x V_b
+      I*omega_dot + omega x (I*omega) = M_b
+      q_dot = 0.5 * q ⊗ [0, omega_b]
+
+    A generic quadratic drag vector opposes body-frame velocity.
+    User force/moment inputs are generic engineering excitations, not a
+    validated aerodynamic or propulsion model for any specific vehicle.
+
+    Body axes use x-forward, y-right, z-up to remain consistent with the
+    app's z-up visualization convention.
+
+    This model is isolated from directed-energy effect calculations.
+    """
+    duration_s = max(float(duration_s), 0.0)
+    dt_s = max(float(dt_s), 0.001)
+    mass = max(float(mass_kg), 1e-3)
+
+    inertia = np.asarray(inertia_kg_m2, dtype=float)
+    if inertia.shape == (3,):
+        inertia = np.diag(np.maximum(inertia, 1e-6))
+    if inertia.shape != (3, 3):
+        raise ValueError("inertia_kg_m2 must be length-3 diagonal values or 3x3 matrix")
+
+    inertia_inv = np.linalg.inv(inertia)
+
+    body_force_command_n = np.asarray(
+        body_force_command_n,
+        dtype=float,
+    )
+    body_moment_command_nm = np.asarray(
+        body_moment_command_nm,
+        dtype=float,
+    )
+
+    q_bi = quaternion_from_euler_deg(
+        initial_roll_deg,
+        initial_pitch_deg,
+        initial_yaw_deg,
+    )
+
+    C_bi = quaternion_to_dcm_body_to_inertial(q_bi)
+    velocity_i = np.asarray(
+        initial_velocity_inertial_mps,
+        dtype=float,
+    )
+    velocity_b = C_bi.T @ velocity_i
+
+    omega_b = np.radians(
+        np.asarray(
+            initial_body_rates_deg_s,
+            dtype=float,
+        )
+    )
+
+    position_i = np.asarray(
+        initial_position_m,
+        dtype=float,
+    ).copy()
+
+    g_i = np.array(
+        [0.0, 0.0, -9.80665],
+        dtype=float,
+    )
+
+    times = np.arange(
+        0.0,
+        duration_s + 0.5 * dt_s,
+        dt_s,
+        dtype=float,
+    )
+    if times.size == 0:
+        times = np.array([0.0], dtype=float)
+    if times[-1] < duration_s - 1e-12:
+        times = np.append(times, duration_s)
+    elif times[-1] > duration_s + 1e-12:
+        times[-1] = duration_s
+
+    rows = []
+
+    for k, t in enumerate(times):
+        if k > 0:
+            dt = float(times[k] - times[k - 1])
+
+            C_bi = quaternion_to_dcm_body_to_inertial(q_bi)
+            C_ib = C_bi.T
+
+            altitude_m = max(float(position_i[2]), 0.0)
+            rho = standard_atmosphere_profile(
+                altitude_m
+            )["density_kg_m3"]
+
+            speed_b = float(
+                np.linalg.norm(
+                    velocity_b
+                )
+            )
+
+            drag_force_b = (
+                -0.5
+                * rho
+                * max(float(reference_area_m2), 0.0)
+                * max(float(drag_coefficient), 0.0)
+                * speed_b
+                * velocity_b
+            )
+
+            force_b = (
+                body_force_command_n
+                + drag_force_b
+            )
+
+            gravity_b = (
+                C_ib @ g_i
+            )
+
+            velocity_dot_b = (
+                force_b / mass
+                + gravity_b
+                - np.cross(
+                    omega_b,
+                    velocity_b,
+                )
+            )
+
+            damping_moment_b = (
+                -max(
+                    float(rotational_damping_nm_per_rad_s),
+                    0.0,
+                )
+                * omega_b
+            )
+
+            moment_b = (
+                body_moment_command_nm
+                + damping_moment_b
+            )
+
+            omega_dot_b = (
+                inertia_inv
+                @ (
+                    moment_b
+                    - np.cross(
+                        omega_b,
+                        inertia @ omega_b,
+                    )
+                )
+            )
+
+            # Semi-implicit integration for rates/velocities.
+            velocity_b = (
+                velocity_b
+                + velocity_dot_b * dt
+            )
+            omega_b = (
+                omega_b
+                + omega_dot_b * dt
+            )
+
+            omega_quat = np.array(
+                [
+                    0.0,
+                    omega_b[0],
+                    omega_b[1],
+                    omega_b[2],
+                ],
+                dtype=float,
+            )
+            q_dot = (
+                0.5
+                * quaternion_multiply(
+                    q_bi,
+                    omega_quat,
+                )
+            )
+            q_bi = quaternion_normalize(
+                q_bi + q_dot * dt
+            )
+
+            C_bi = quaternion_to_dcm_body_to_inertial(q_bi)
+            velocity_i = (
+                C_bi @ velocity_b
+            )
+            position_i = (
+                position_i
+                + velocity_i * dt
+            )
+
+        C_bi = quaternion_to_dcm_body_to_inertial(q_bi)
+        velocity_i = C_bi @ velocity_b
+        roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_deg(q_bi)
+
+        translational_ke_j = (
+            0.5
+            * mass
+            * float(
+                velocity_b @ velocity_b
+            )
+        )
+        rotational_ke_j = (
+            0.5
+            * float(
+                omega_b
+                @ (
+                    inertia @ omega_b
+                )
+            )
+        )
+
+        rows.append(
+            {
+                "Time (s)": float(t),
+                "X (m)": float(position_i[0]),
+                "Y (m)": float(position_i[1]),
+                "Z (m)": float(max(position_i[2], 0.0)),
+                "VX (m/s)": float(velocity_i[0]),
+                "VY (m/s)": float(velocity_i[1]),
+                "VZ (m/s)": float(velocity_i[2]),
+                "U body (m/s)": float(velocity_b[0]),
+                "V body (m/s)": float(velocity_b[1]),
+                "W body (m/s)": float(velocity_b[2]),
+                "Speed (m/s)": float(np.linalg.norm(velocity_i)),
+                "Roll (deg)": float(roll_deg),
+                "Pitch (deg)": float(pitch_deg),
+                "Yaw (deg)": float(yaw_deg),
+                "p body rate (deg/s)": float(math.degrees(omega_b[0])),
+                "q body rate (deg/s)": float(math.degrees(omega_b[1])),
+                "r body rate (deg/s)": float(math.degrees(omega_b[2])),
+                "Quaternion q0": float(q_bi[0]),
+                "Quaternion q1": float(q_bi[1]),
+                "Quaternion q2": float(q_bi[2]),
+                "Quaternion q3": float(q_bi[3]),
+                "Quaternion Norm": float(np.linalg.norm(q_bi)),
+                "Translational KE (J)": translational_ke_j,
+                "Rotational KE (J)": rotational_ke_j,
+            }
+        )
+
+        if (
+            position_i[2] <= 0.0
+            and k > 0
+            and velocity_i[2] < 0.0
+        ):
+            break
+
+    return pd.DataFrame(rows)
+
+
+def six_dof_vv_benchmarks():
+    """
+    Independent sanity checks for the generic 6-DOF rigid-body model.
+    """
+    rows = []
+
+    # 1) Quaternion normalization under constant body-rate rotation.
+    rotation_case = generic_six_dof_rigid_body(
+        initial_position_m=np.array([0.0, 0.0, 1000.0]),
+        initial_velocity_inertial_mps=np.zeros(3),
+        initial_roll_deg=0.0,
+        initial_pitch_deg=0.0,
+        initial_yaw_deg=0.0,
+        initial_body_rates_deg_s=np.array([10.0, 0.0, 0.0]),
+        duration_s=2.0,
+        dt_s=0.002,
+        mass_kg=100.0,
+        inertia_kg_m2=np.array([50.0, 60.0, 70.0]),
+        body_force_command_n=np.array([0.0, 0.0, 980.665]),
+        body_moment_command_nm=np.zeros(3),
+        reference_area_m2=0.0,
+        drag_coefficient=0.0,
+        rotational_damping_nm_per_rad_s=0.0,
+    )
+    quat_error = float(
+        np.max(
+            np.abs(
+                rotation_case["Quaternion Norm"].to_numpy(dtype=float)
+                - 1.0
+            )
+        )
+    )
+    rows.append(
+        {
+            "Benchmark": "Quaternion normalization",
+            "Error": quat_error,
+            "Tolerance": 1e-9,
+            "Units": "norm",
+            "Status": "PASS" if quat_error <= 1e-9 else "FAIL",
+        }
+    )
+
+    # 2) Torque-free principal-axis rotation should retain p nearly constant.
+    p_values = rotation_case["p body rate (deg/s)"].to_numpy(dtype=float)
+    p_drift = float(np.max(np.abs(p_values - p_values[0])))
+    rows.append(
+        {
+            "Benchmark": "Principal-axis body-rate preservation",
+            "Error": p_drift,
+            "Tolerance": 0.02,
+            "Units": "deg/s",
+            "Status": "PASS" if p_drift <= 0.02 else "FAIL",
+        }
+    )
+
+    # 3) Free-fall vertical displacement against analytic z=z0-1/2*g*t^2.
+    free_fall = generic_six_dof_rigid_body(
+        initial_position_m=np.array([0.0, 0.0, 1000.0]),
+        initial_velocity_inertial_mps=np.zeros(3),
+        initial_roll_deg=0.0,
+        initial_pitch_deg=0.0,
+        initial_yaw_deg=0.0,
+        initial_body_rates_deg_s=np.zeros(3),
+        duration_s=2.0,
+        dt_s=0.001,
+        mass_kg=100.0,
+        inertia_kg_m2=np.array([50.0, 60.0, 70.0]),
+        body_force_command_n=np.zeros(3),
+        body_moment_command_nm=np.zeros(3),
+        reference_area_m2=0.0,
+        drag_coefficient=0.0,
+        rotational_damping_nm_per_rad_s=0.0,
+    )
+    expected_z = 1000.0 - 0.5 * 9.80665 * 2.0**2
+    free_fall_error = abs(
+        float(free_fall["Z (m)"].iloc[-1])
+        - expected_z
+    )
+    rows.append(
+        {
+            "Benchmark": "6-DOF free-fall displacement",
+            "Error": free_fall_error,
+            "Tolerance": 0.05,
+            "Units": "m",
+            "Status": "PASS" if free_fall_error <= 0.05 else "FAIL",
+        }
+    )
+
+    return pd.DataFrame(rows)
+
+
 def moving_platform_truth(
     duration_s: float,
     dt_s: float,
@@ -7617,7 +8083,23 @@ with tab8:
     adv_col1, adv_col2 = st.columns(2)
 
     with adv_col1:
-        st.markdown("#### 3D Maneuvering Truth + Attitude Kinematics")
+        st.markdown("#### Aerospace Truth-Model Fidelity")
+
+        advanced_fidelity_level = st.selectbox(
+            "Truth-model fidelity",
+            [
+                "3-DOF Point Mass",
+                "6-DOF Rigid Body",
+            ],
+            key="advanced_fidelity_level",
+            help=(
+                "The 6-DOF model propagates translation, body velocity, quaternion "
+                "attitude, and body angular rates using generic forces/moments. "
+                "It remains isolated from directed-energy effect calculations."
+            ),
+        )
+
+        st.markdown("#### Maneuver / Initial-State Controls")
         advanced_trajectory_mode = st.selectbox(
             "Generic trajectory mode",
             [
@@ -7786,6 +8268,201 @@ with tab8:
     adv_velocity_norm = max(float(np.linalg.norm(adv_velocity)), 1e-9)
     adv_velocity = adv_velocity / adv_velocity_norm * float(adv_speed_mps)
 
+    if advanced_fidelity_level == "6-DOF Rigid Body":
+        st.markdown("#### Generic 6-DOF Rigid-Body Parameters")
+
+        rb1, rb2, rb3 = st.columns(3)
+        with rb1:
+            rb_mass_kg = st.number_input(
+                "Mass (kg)",
+                min_value=10.0,
+                max_value=50000.0,
+                value=500.0,
+                step=10.0,
+                key="rb_mass_kg",
+            )
+            rb_ixx = st.number_input(
+                "Ixx (kg·m²)",
+                min_value=1.0,
+                max_value=1_000_000.0,
+                value=900.0,
+                step=10.0,
+                key="rb_ixx",
+            )
+            rb_iyy = st.number_input(
+                "Iyy (kg·m²)",
+                min_value=1.0,
+                max_value=1_000_000.0,
+                value=1200.0,
+                step=10.0,
+                key="rb_iyy",
+            )
+            rb_izz = st.number_input(
+                "Izz (kg·m²)",
+                min_value=1.0,
+                max_value=1_000_000.0,
+                value=1500.0,
+                step=10.0,
+                key="rb_izz",
+            )
+
+        with rb2:
+            rb_force_x_n = st.number_input(
+                "Body X force command (N)",
+                min_value=-100000.0,
+                max_value=100000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_force_x_n",
+            )
+            rb_force_y_n = st.number_input(
+                "Body Y force command (N)",
+                min_value=-50000.0,
+                max_value=50000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_force_y_n",
+            )
+            rb_force_z_n = st.number_input(
+                "Body Z force command (N)",
+                min_value=-50000.0,
+                max_value=50000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_force_z_n",
+            )
+            rb_reference_area_m2 = st.number_input(
+                "Reference area (m²)",
+                min_value=0.0,
+                max_value=200.0,
+                value=2.0,
+                step=0.1,
+                key="rb_reference_area_m2",
+            )
+            rb_drag_coefficient = st.number_input(
+                "Generic drag coefficient",
+                min_value=0.0,
+                max_value=3.0,
+                value=0.15,
+                step=0.01,
+                key="rb_drag_coefficient",
+            )
+
+        with rb3:
+            rb_roll_moment_nm = st.number_input(
+                "Roll moment L (N·m)",
+                min_value=-100000.0,
+                max_value=100000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_roll_moment_nm",
+            )
+            rb_pitch_moment_nm = st.number_input(
+                "Pitch moment M (N·m)",
+                min_value=-100000.0,
+                max_value=100000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_pitch_moment_nm",
+            )
+            rb_yaw_moment_nm = st.number_input(
+                "Yaw moment N (N·m)",
+                min_value=-100000.0,
+                max_value=100000.0,
+                value=0.0,
+                step=100.0,
+                key="rb_yaw_moment_nm",
+            )
+            rb_rot_damping = st.number_input(
+                "Rotational damping (N·m per rad/s)",
+                min_value=0.0,
+                max_value=100000.0,
+                value=50.0,
+                step=10.0,
+                key="rb_rot_damping",
+            )
+
+        rb4, rb5, rb6 = st.columns(3)
+        with rb4:
+            rb_initial_roll_deg = st.slider(
+                "Initial roll (deg)",
+                -180.0,
+                180.0,
+                float(adv_bank_angle_deg),
+                1.0,
+                key="rb_initial_roll_deg",
+            )
+            rb_initial_p_deg_s = st.slider(
+                "Initial p body rate (deg/s)",
+                -60.0,
+                60.0,
+                float(adv_roll_rate),
+                1.0,
+                key="rb_initial_p_deg_s",
+            )
+        with rb5:
+            rb_initial_pitch_deg = st.slider(
+                "Initial pitch (deg)",
+                -89.0,
+                89.0,
+                float(tgt.flight_path_angle_deg),
+                1.0,
+                key="rb_initial_pitch_deg",
+            )
+            rb_initial_q_deg_s = st.slider(
+                "Initial q body rate (deg/s)",
+                -60.0,
+                60.0,
+                float(adv_pitch_rate),
+                1.0,
+                key="rb_initial_q_deg_s",
+            )
+        with rb6:
+            rb_initial_yaw_deg = st.slider(
+                "Initial yaw (deg)",
+                -180.0,
+                180.0,
+                float(
+                    math.degrees(
+                        math.atan2(
+                            adv_velocity[1],
+                            adv_velocity[0],
+                        )
+                    )
+                ),
+                1.0,
+                key="rb_initial_yaw_deg",
+            )
+            rb_initial_r_deg_s = st.slider(
+                "Initial r body rate (deg/s)",
+                -60.0,
+                60.0,
+                float(adv_yaw_rate),
+                1.0,
+                key="rb_initial_r_deg_s",
+            )
+    else:
+        rb_mass_kg = 500.0
+        rb_ixx, rb_iyy, rb_izz = 900.0, 1200.0, 1500.0
+        rb_force_x_n = rb_force_y_n = rb_force_z_n = 0.0
+        rb_reference_area_m2 = 2.0
+        rb_drag_coefficient = 0.15
+        rb_roll_moment_nm = rb_pitch_moment_nm = rb_yaw_moment_nm = 0.0
+        rb_rot_damping = 50.0
+        rb_initial_roll_deg = float(adv_bank_angle_deg)
+        rb_initial_pitch_deg = float(tgt.flight_path_angle_deg)
+        rb_initial_yaw_deg = float(
+            math.degrees(
+                math.atan2(
+                    adv_velocity[1],
+                    adv_velocity[0],
+                )
+            )
+        )
+        rb_initial_p_deg_s = float(adv_roll_rate)
+        rb_initial_q_deg_s = float(adv_pitch_rate)
+        rb_initial_r_deg_s = float(adv_yaw_rate)
+
     if advanced_trajectory_mode == "Accelerating Translation":
         mode_lat_accel = adv_lateral_accel + 2.0
         mode_vert_accel = adv_vertical_accel
@@ -7821,6 +8498,12 @@ with tab8:
     av2.metric("Solver Resolution", adv_validity["solver_status"])
     av3.metric("Trajectory Validity", adv_validity["trajectory_validity"])
     av4.metric("Overall Confidence", adv_validity["overall"])
+
+    st.caption(
+        f"Active Advanced Twin truth model: {advanced_fidelity_level}. "
+        "The 6-DOF rigid-body option is generic and non-validated; it does not "
+        "feed the directed-energy effect calculations."
+    )
 
     adv_truth = generic_maneuvering_truth_attitude_kinematics(
         target_initial_position_m(env, tgt),
@@ -7858,17 +8541,70 @@ with tab8:
         flight_path_rate_deg_s=adv_flight_path_rate,
     )
 
-    # Use the formal 3-DOF point-mass trajectory as the Advanced Twin truth
-    # whenever available. The older maneuvering/attitude-kinematics dataframe
-    # remains available as a separate educational reference model.
-    adv_truth_for_sensing = (
-        formal_point_mass_truth.rename(
-            columns={
-                "Heading (deg)": "Yaw (deg)",
-                "Flight Path Angle (deg)": "Pitch (deg)",
-            }
-        )
+    six_dof_truth = generic_six_dof_rigid_body(
+        initial_position_m=target_initial_position_m(
+            env,
+            tgt,
+        ),
+        initial_velocity_inertial_mps=adv_velocity,
+        initial_roll_deg=rb_initial_roll_deg,
+        initial_pitch_deg=rb_initial_pitch_deg,
+        initial_yaw_deg=rb_initial_yaw_deg,
+        initial_body_rates_deg_s=np.array(
+            [
+                rb_initial_p_deg_s,
+                rb_initial_q_deg_s,
+                rb_initial_r_deg_s,
+            ],
+            dtype=float,
+        ),
+        duration_s=adv_duration_s,
+        dt_s=min(
+            adv_dt_s,
+            adv_recommended_dt,
+            0.01,
+        ),
+        mass_kg=rb_mass_kg,
+        inertia_kg_m2=np.array(
+            [
+                rb_ixx,
+                rb_iyy,
+                rb_izz,
+            ],
+            dtype=float,
+        ),
+        body_force_command_n=np.array(
+            [
+                rb_force_x_n,
+                rb_force_y_n,
+                rb_force_z_n,
+            ],
+            dtype=float,
+        ),
+        body_moment_command_nm=np.array(
+            [
+                rb_roll_moment_nm,
+                rb_pitch_moment_nm,
+                rb_yaw_moment_nm,
+            ],
+            dtype=float,
+        ),
+        reference_area_m2=rb_reference_area_m2,
+        drag_coefficient=rb_drag_coefficient,
+        rotational_damping_nm_per_rad_s=rb_rot_damping,
     )
+
+    if advanced_fidelity_level == "6-DOF Rigid Body":
+        adv_truth_for_sensing = six_dof_truth.copy()
+    else:
+        adv_truth_for_sensing = (
+            formal_point_mass_truth.rename(
+                columns={
+                    "Heading (deg)": "Yaw (deg)",
+                    "Flight Path Angle (deg)": "Pitch (deg)",
+                }
+            )
+        )
 
     for axis in [
         "VX (m/s)",
@@ -8210,6 +8946,46 @@ with tab8:
         else "CHECK",
     )
 
+    st.markdown("#### 6-DOF Rigid-Body V&V")
+    sixdof_benchmark_df = six_dof_vv_benchmarks()
+    st.dataframe(
+        sixdof_benchmark_df,
+        width="stretch",
+        hide_index=True,
+    )
+    sixdof_benchmark_pass = bool(
+        (
+            sixdof_benchmark_df["Status"]
+            == "PASS"
+        ).all()
+    )
+    st.metric(
+        "6-DOF Benchmark Status",
+        "PASS"
+        if sixdof_benchmark_pass
+        else "CHECK",
+    )
+
+    if advanced_fidelity_level == "6-DOF Rigid Body" and not six_dof_truth.empty:
+        sixdof_final = six_dof_truth.iloc[-1]
+        sixdof_metrics = st.columns(4)
+        sixdof_metrics[0].metric(
+            "Quaternion Norm",
+            f"{sixdof_final['Quaternion Norm']:.8f}",
+        )
+        sixdof_metrics[1].metric(
+            "Final Roll",
+            f"{sixdof_final['Roll (deg)']:.1f}°",
+        )
+        sixdof_metrics[2].metric(
+            "Final Pitch",
+            f"{sixdof_final['Pitch (deg)']:.1f}°",
+        )
+        sixdof_metrics[3].metric(
+            "Final Yaw",
+            f"{sixdof_final['Yaw (deg)']:.1f}°",
+        )
+
     st.markdown("#### Verification & Validation")
     if st.button(
         "Run Quantitative Timestep Convergence Check",
@@ -8248,6 +9024,16 @@ with tab8:
         "Power Ratio Bounds",
         "PASS" if balance["power_ratio_valid"] else "CHECK",
     )
+
+    if not six_dof_truth.empty:
+        sixdof_csv = six_dof_truth.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Generic 6-DOF Rigid-Body Truth CSV",
+            sixdof_csv,
+            file_name="advanced_generic_6dof_rigid_body_truth.csv",
+            mime="text/csv",
+            width="stretch",
+        )
 
     st.markdown("#### Advanced Twin Data Export")
     adv_truth_csv = adv_truth.to_csv(index=False).encode("utf-8")
