@@ -3674,6 +3674,35 @@ def build_3d_digital_twin_figure(
     y_sel_km = float(p_sel[1] / 1000.0)
     z_sel_km = float(p_sel[2] / 1000.0)
 
+    # UI-only auto-fit. The authoritative x/y/z trajectory remains unchanged.
+    all_x = np.concatenate([x_km, np.array([0.0])])
+    all_y = np.concatenate([y_km, np.array([0.0])])
+    all_z = np.concatenate([z_km, np.array([0.0])])
+
+    def _axis_range(values, min_span=0.8, pad_fraction=0.12):
+        vmin = float(np.nanmin(values))
+        vmax = float(np.nanmax(values))
+        span = max(vmax - vmin, min_span)
+        pad = max(span * pad_fraction, 0.15)
+        center = 0.5 * (vmin + vmax)
+        half = 0.5 * span + pad
+        return [center - half, center + half]
+
+    x_range = _axis_range(all_x)
+    y_range = _axis_range(all_y)
+    z_range = _axis_range(all_z, min_span=0.5, pad_fraction=0.15)
+
+    x_span = max(x_range[1] - x_range[0], 1e-6)
+    y_span = max(y_range[1] - y_range[0], 1e-6)
+    z_span = max(z_range[1] - z_range[0], 1e-6)
+    max_span = max(x_span, y_span, z_span)
+
+    aspect_ratio = dict(
+        x=max(x_span / max_span, 0.28),
+        y=max(y_span / max_span, 0.28),
+        z=max(z_span / max_span, 0.22),
+    )
+
     geometry = engagement_geometry(env, tgt)
     t_cpa = geometry["time_to_cpa_s"]
     p_cpa = geometry["cpa_position_m"]
@@ -3727,19 +3756,24 @@ def build_3d_digital_twin_figure(
 
     camera_map = {
         "Isometric": dict(
-            eye=dict(x=1.35, y=1.35, z=0.85)
+            eye=dict(x=1.10, y=1.10, z=0.78),
+            center=dict(x=0.0, y=0.0, z=-0.02),
         ),
         "Top-Down": dict(
-            eye=dict(x=0.0, y=0.0, z=2.35)
+            eye=dict(x=0.0, y=0.0, z=1.85),
+            center=dict(x=0.0, y=0.0, z=0.0),
         ),
         "Tactical": dict(
-            eye=dict(x=1.75, y=0.55, z=0.65)
+            eye=dict(x=1.35, y=0.42, z=0.52),
+            center=dict(x=0.0, y=0.0, z=-0.03),
         ),
         "Beam Sight": dict(
-            eye=dict(x=-0.20, y=-0.15, z=0.30)
+            eye=dict(x=-0.12, y=-0.10, z=0.24),
+            center=dict(x=0.0, y=0.0, z=0.0),
         ),
         "Target Chase": dict(
-            eye=dict(x=0.55, y=1.85, z=0.55)
+            eye=dict(x=0.42, y=1.45, z=0.45),
+            center=dict(x=0.0, y=0.0, z=-0.02),
         ),
     }
     camera = camera_map.get(
@@ -3817,7 +3851,7 @@ def build_3d_digital_twin_figure(
             z=[0.0],
             mode="markers+text",
             marker=dict(
-                size=11,
+                size=13,
                 color=HUD_GREEN_BRIGHT,
                 symbol="diamond",
                 line=dict(
@@ -3878,7 +3912,7 @@ def build_3d_digital_twin_figure(
             z=[z_sel_km],
             mode="markers",
             marker=dict(
-                size=18,
+                size=22,
                 color="rgba(0,0,0,0)",
                 symbol="circle",
                 line=dict(
@@ -3904,7 +3938,7 @@ def build_3d_digital_twin_figure(
             z=[z_sel_km],
             mode="markers+text",
             marker=dict(
-                size=10,
+                size=13,
                 color=CURRENT_TARGET_BLUE,
                 symbol="circle",
                 line=dict(
@@ -3960,7 +3994,7 @@ def build_3d_digital_twin_figure(
                 z=[cpa_z_km],
                 mode="markers+text",
                 marker=dict(
-                    size=7,
+                    size=10,
                     color="#FFFFFF",
                     symbol="x",
                 ),
@@ -4172,7 +4206,7 @@ def build_3d_digital_twin_figure(
                     z=[p_evt[2] / 1000.0],
                     mode="markers+text",
                     marker=dict(
-                        size=6,
+                        size=9,
                         color=color,
                         symbol="diamond",
                     ),
@@ -4262,7 +4296,7 @@ def build_3d_digital_twin_figure(
                             z=[pz],
                             mode="markers",
                             marker=dict(
-                                size=18,
+                                size=22,
                                 color="rgba(0,0,0,0)",
                                 symbol="circle",
                                 line=dict(
@@ -4278,7 +4312,7 @@ def build_3d_digital_twin_figure(
                             z=[pz],
                             mode="markers+text",
                             marker=dict(
-                                size=10,
+                                size=13,
                                 color=CURRENT_TARGET_BLUE,
                                 symbol="circle",
                                 line=dict(
@@ -4414,7 +4448,7 @@ def build_3d_digital_twin_figure(
         )
 
     fig.update_layout(
-        height=780,
+        height=700,
         margin=dict(
             l=0,
             r=0,
@@ -4423,6 +4457,7 @@ def build_3d_digital_twin_figure(
         ),
         paper_bgcolor=HUD_BG,
         plot_bgcolor=HUD_BG,
+        uirevision="directed-energy-3d-view",
         font=dict(
             color=HUD_TEXT,
             family="Consolas, monospace",
@@ -4439,15 +4474,24 @@ def build_3d_digital_twin_figure(
             ),
         ),
         legend=dict(
-            bgcolor="rgba(2,4,2,0.75)",
+            orientation="h",
+            x=0.02,
+            y=0.98,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(2,4,2,0.58)",
             bordercolor=HUD_GREEN_DIM,
             borderwidth=1,
+            font=dict(size=10),
+            itemsizing="constant",
         ),
         scene=dict(
             bgcolor=HUD_BG,
-            aspectmode="data",
+            aspectmode="manual",
+            aspectratio=aspect_ratio,
             xaxis=dict(
                 title="X / LOS Axis (km)",
+                range=x_range,
                 color=HUD_TEXT,
                 gridcolor="#173817",
                 zerolinecolor=HUD_GREEN_DIM,
@@ -4455,6 +4499,7 @@ def build_3d_digital_twin_figure(
             ),
             yaxis=dict(
                 title="Y / Cross-Range (km)",
+                range=y_range,
                 color=HUD_TEXT,
                 gridcolor="#173817",
                 zerolinecolor=HUD_GREEN_DIM,
@@ -4462,6 +4507,7 @@ def build_3d_digital_twin_figure(
             ),
             zaxis=dict(
                 title="Z / Altitude (km)",
+                range=z_range,
                 color=HUD_TEXT,
                 gridcolor="#3A2814",
                 zerolinecolor=HUD_ORANGE_DIM,
