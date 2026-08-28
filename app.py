@@ -4648,6 +4648,171 @@ def generic_maneuvering_truth_attitude_kinematics(
     return pd.DataFrame(rows)
 
 
+def generic_point_mass_flight_dynamics(
+    initial_position_m: np.ndarray,
+    initial_speed_mps: float,
+    initial_heading_deg: float,
+    initial_flight_path_deg: float,
+    duration_s: float,
+    dt_s: float,
+    mode: str,
+    bank_angle_deg: float = 0.0,
+    longitudinal_accel_mps2: float = 0.0,
+    flight_path_rate_deg_s: float = 0.0,
+):
+    """
+    Generic 3-DOF point-mass flight-mechanics model for aerospace education.
+
+    States:
+      position = [x, y, z]
+      speed V
+      heading chi
+      flight-path angle gamma
+
+    Kinematics:
+      x_dot = V cos(gamma) cos(chi)
+      y_dot = V cos(gamma) sin(chi)
+      z_dot = V sin(gamma)
+
+    For the generic coordinated-turn mode:
+      chi_dot = g tan(phi) / (V cos(gamma))
+
+    The ballistic mode applies gravity to the inertial velocity vector.
+
+    This model is isolated from directed-energy effect calculations and is
+    intended for trajectory/V&V demonstration only.
+    """
+    dt_s = max(float(dt_s), 0.005)
+    duration_s = max(float(duration_s), 0.0)
+    g = 9.80665
+
+    times = np.arange(
+        0.0,
+        duration_s + 0.5 * dt_s,
+        dt_s,
+        dtype=float,
+    )
+    if times.size == 0:
+        times = np.array([0.0], dtype=float)
+    if times[-1] < duration_s - 1e-12:
+        times = np.append(times, duration_s)
+    elif times[-1] > duration_s + 1e-12:
+        times[-1] = duration_s
+
+    pos = np.asarray(
+        initial_position_m,
+        dtype=float,
+    ).copy()
+
+    V = max(float(initial_speed_mps), 0.0)
+    chi = math.radians(float(initial_heading_deg))
+    gamma = math.radians(float(initial_flight_path_deg))
+    bank = math.radians(float(bank_angle_deg))
+
+    ballistic_velocity = np.array(
+        [
+            V * math.cos(gamma) * math.cos(chi),
+            V * math.cos(gamma) * math.sin(chi),
+            V * math.sin(gamma),
+        ],
+        dtype=float,
+    )
+
+    rows = []
+
+    for k, t in enumerate(times):
+        if k > 0:
+            dt = float(
+                times[k] - times[k - 1]
+            )
+
+            if mode == "Generic Ballistic Arc":
+                ballistic_velocity[2] -= g * dt
+                pos += ballistic_velocity * dt
+
+                V = float(
+                    np.linalg.norm(
+                        ballistic_velocity
+                    )
+                )
+                horizontal_speed = max(
+                    math.hypot(
+                        ballistic_velocity[0],
+                        ballistic_velocity[1],
+                    ),
+                    1e-9,
+                )
+                chi = math.atan2(
+                    ballistic_velocity[1],
+                    ballistic_velocity[0],
+                )
+                gamma = math.atan2(
+                    ballistic_velocity[2],
+                    horizontal_speed,
+                )
+            else:
+                if mode == "Accelerating Translation":
+                    V = max(
+                        0.0,
+                        V
+                        + float(longitudinal_accel_mps2)
+                        * dt,
+                    )
+
+                if mode in (
+                    "Coordinated Turn",
+                    "Generic Turning Maneuver",
+                ):
+                    cos_gamma = max(
+                        abs(math.cos(gamma)),
+                        1e-3,
+                    )
+                    chi_dot = (
+                        g
+                        * math.tan(bank)
+                        / max(V * cos_gamma, 1e-6)
+                    )
+                    chi += chi_dot * dt
+
+                if mode == "Climb / Descent":
+                    gamma += math.radians(
+                        float(flight_path_rate_deg_s)
+                    ) * dt
+
+                velocity = np.array(
+                    [
+                        V * math.cos(gamma) * math.cos(chi),
+                        V * math.cos(gamma) * math.sin(chi),
+                        V * math.sin(gamma),
+                    ],
+                    dtype=float,
+                )
+                pos += velocity * dt
+
+        rows.append(
+            {
+                "Time (s)": float(t),
+                "X (m)": float(pos[0]),
+                "Y (m)": float(pos[1]),
+                "Z (m)": float(max(pos[2], 0.0)),
+                "Speed (m/s)": float(V),
+                "Heading (deg)": math.degrees(chi),
+                "Flight Path Angle (deg)": math.degrees(gamma),
+                "Bank Angle (deg)": float(bank_angle_deg),
+                "Trajectory Mode": mode,
+            }
+        )
+
+        if (
+            pos[2] <= 0.0
+            and k > 0
+            and mode == "Generic Ballistic Arc"
+        ):
+            break
+
+    return pd.DataFrame(rows)
+
+
 def moving_platform_truth(
     duration_s: float,
     dt_s: float,
@@ -4787,6 +4952,155 @@ def generic_measurement_reconstruction(
     return pd.DataFrame(rows)
 
 
+def standard_atmosphere_profile(altitude_m: float):
+    """
+    Low-order ISA-like atmospheric profile used by the Advanced Twin V&V tools.
+
+    Returns temperature, pressure, density, and a relative molecular-density
+    ratio. This is a generic aerospace environment model, not a high-fidelity
+    radiative-transfer or weather model.
+    """
+    h = max(float(altitude_m), 0.0)
+    g0 = 9.80665
+    R = 287.05
+
+    if h <= 11000.0:
+        T0 = 288.15
+        lapse = -0.0065
+        T = T0 + lapse * h
+        p = 101325.0 * (T / T0) ** (-g0 / (lapse * R))
+    else:
+        T = 216.65
+        p11 = 22632.06
+        p = p11 * math.exp(
+            -g0 * (h - 11000.0) / (R * T)
+        )
+
+    rho = p / (R * T)
+    rho_ratio = rho / 1.225
+
+    return {
+        "temperature_k": T,
+        "pressure_pa": p,
+        "density_kg_m3": rho,
+        "density_ratio": rho_ratio,
+    }
+
+
+def profile_aware_visibility_index(
+    slant_range_km: float,
+    platform_altitude_m: float,
+    target_altitude_m: float,
+    surface_visibility_km: float,
+    surface_humidity_pct: float,
+    layers: int = 48,
+):
+    """
+    Generic profile-aware atmospheric visibility/transmission index.
+
+    The path is discretized between platform and target altitude. Aerosol
+    extinction decays with altitude, humidity decays with a generic scale
+    height, and molecular extinction follows ISA density ratio.
+
+    This tool is intentionally isolated from the directed-energy effect model.
+    """
+    layers = max(int(layers), 8)
+    path_km = max(float(slant_range_km), 0.0)
+
+    s = np.linspace(0.0, 1.0, layers)
+    z_m = (
+        float(platform_altitude_m)
+        + s * (
+            float(target_altitude_m)
+            - float(platform_altitude_m)
+        )
+    )
+
+    base_aerosol = 3.912 / max(float(surface_visibility_km), 0.2)
+    humidity_fraction = clamp(
+        float(surface_humidity_pct) / 100.0,
+        0.0,
+        1.0,
+    )
+
+    aerosol_ext = []
+    humidity_ext = []
+    molecular_ext = []
+
+    for h_m in z_m:
+        profile = standard_atmosphere_profile(h_m)
+
+        aerosol_ext.append(
+            base_aerosol
+            * math.exp(
+                -max(float(h_m), 0.0) / 1500.0
+            )
+        )
+
+        humidity_ext.append(
+            0.015
+            * humidity_fraction
+            * math.exp(
+                -max(float(h_m), 0.0) / 2000.0
+            )
+        )
+
+        molecular_ext.append(
+            0.012
+            * profile["density_ratio"]
+        )
+
+    aerosol_ext = np.asarray(
+        aerosol_ext,
+        dtype=float,
+    )
+    humidity_ext = np.asarray(
+        humidity_ext,
+        dtype=float,
+    )
+    molecular_ext = np.asarray(
+        molecular_ext,
+        dtype=float,
+    )
+
+    total_extinction = (
+        aerosol_ext
+        + humidity_ext
+        + molecular_ext
+    )
+
+    path_coordinate_km = (
+        s * path_km
+    )
+
+    optical_depth = float(
+        np.trapezoid(
+            total_extinction,
+            path_coordinate_km,
+        )
+    )
+
+    transmission_index = clamp(
+        math.exp(-optical_depth),
+        0.0,
+        1.0,
+    )
+
+    return {
+        "optical_depth": optical_depth,
+        "visibility_index": transmission_index,
+        "mean_aerosol_extinction_km_inv": float(
+            np.mean(aerosol_ext)
+        ),
+        "mean_humidity_extinction_km_inv": float(
+            np.mean(humidity_ext)
+        ),
+        "mean_molecular_extinction_km_inv": float(
+            np.mean(molecular_ext)
+        ),
+    }
+
+
 def layered_visibility_index(
     slant_range_km: float,
     target_altitude_m: float,
@@ -4795,27 +5109,18 @@ def layered_visibility_index(
     layers: int = 24,
 ):
     """
-    Generic layered atmosphere for sensor-visibility/V&V studies.
+    Backward-compatible wrapper for the prior ground-based visibility index.
 
-    This is not a high-fidelity laser propagation model. It produces a normalized
-    visibility/transmission index by integrating a simple altitude-decaying
-    extinction field along a straight slant path.
+    Uses the profile-aware model with platform altitude fixed at z=0.
     """
-    layers = max(int(layers), 4)
-    s = np.linspace(0.0, 1.0, layers)
-    z_km = (max(target_altitude_m, 0.0) / 1000.0) * s
-
-    base_ext = 3.912 / max(surface_visibility_km, 0.2)
-    aerosol = base_ext * np.exp(-z_km / 1.5)
-    humidity = 0.015 * clamp(humidity_pct / 100.0, 0.0, 1.0) * np.exp(-z_km / 2.0)
-    extinction = aerosol + humidity
-
-    ds_km = max(slant_range_km, 0.0) / max(layers - 1, 1)
-    optical_depth = float(np.trapezoid(extinction, dx=ds_km))
-    return {
-        "optical_depth": optical_depth,
-        "visibility_index": clamp(math.exp(-optical_depth), 0.0, 1.0),
-    }
+    return profile_aware_visibility_index(
+        slant_range_km=slant_range_km,
+        platform_altitude_m=0.0,
+        target_altitude_m=target_altitude_m,
+        surface_visibility_km=surface_visibility_km,
+        surface_humidity_pct=humidity_pct,
+        layers=layers,
+    )
 
 
 def second_order_gimbal_response(
@@ -4933,10 +5238,13 @@ def timestep_convergence_study(
     platform: PlatformState,
 ):
     """
-    Generic timestep sensitivity check for the existing low-order model.
+    Quantitative timestep sensitivity study for the existing low-order model.
+
+    Uses a refinement sequence and reports differences relative to the finest
+    evaluated solution. This is numerical verification, not empirical validation.
     """
-    dts = [0.20, 0.10, 0.05]
-    rows = []
+    dts = [0.10, 0.05, 0.025, 0.0125]
+    raw_rows = []
 
     for dt in dts:
         timeline_dt, final_dt = simulate_time_stepped_engagement(
@@ -4949,17 +5257,236 @@ def timestep_convergence_study(
             stochastic_measurements=False,
         )
 
-        rows.append(
+        actual_dt = (
+            float(
+                timeline_dt["Time (s)"].diff().dropna().median()
+            )
+            if len(timeline_dt) > 1
+            else float("nan")
+        )
+
+        raw_rows.append(
             {
-                "dt (s)": dt,
+                "Requested dt (s)": dt,
+                "Actual median dt (s)": actual_dt,
                 "Timeline Rows": len(timeline_dt),
-                "Final Range (km)": final_dt.get("Final Range (km)", float("nan")),
-                "Track Quality": final_dt.get("Track Quality", float("nan")),
-                "Atmospheric Transmission": final_dt.get("Atmospheric Transmission", float("nan")),
-                "Thermal Effect Index": final_dt.get("Estimated Thermal Effect Index", float("nan")),
-                "Readiness Score": final_dt.get("Readiness Score", float("nan")),
+                "Final Range (km)": final_dt.get(
+                    "Final Range (km)",
+                    float("nan"),
+                ),
+                "Track Quality": final_dt.get(
+                    "Track Quality",
+                    float("nan"),
+                ),
+                "Atmospheric Transmission": final_dt.get(
+                    "Atmospheric Transmission",
+                    float("nan"),
+                ),
+                "Thermal Effect Index": final_dt.get(
+                    "Estimated Thermal Effect Index",
+                    float("nan"),
+                ),
+                "Readiness Score": final_dt.get(
+                    "Readiness Score",
+                    float("nan"),
+                ),
             }
         )
+
+    df = pd.DataFrame(raw_rows)
+
+    reference = df.iloc[-1]
+
+    for metric in [
+        "Final Range (km)",
+        "Track Quality",
+        "Atmospheric Transmission",
+        "Thermal Effect Index",
+        "Readiness Score",
+    ]:
+        ref_value = float(reference[metric])
+
+        if math.isfinite(ref_value):
+            denominator = max(
+                abs(ref_value),
+                1e-12,
+            )
+            df[f"{metric} Rel. Error"] = (
+                abs(
+                    df[metric].astype(float)
+                    - ref_value
+                )
+                / denominator
+            )
+        else:
+            df[f"{metric} Rel. Error"] = float("nan")
+
+    return df
+
+
+def analytical_vv_benchmarks():
+    """
+    Independent analytical benchmarks for generic aerospace helper models.
+
+    These benchmarks do not exercise target-effect calculations.
+    """
+    rows = []
+
+    # Benchmark 1: constant-velocity point mass.
+    r0 = np.array(
+        [1000.0, -500.0, 2000.0],
+        dtype=float,
+    )
+    V = 200.0
+    heading_deg = 30.0
+    gamma_deg = 10.0
+    T = 5.0
+    dt = 0.01
+
+    traj = generic_point_mass_flight_dynamics(
+        r0,
+        V,
+        heading_deg,
+        gamma_deg,
+        T,
+        dt,
+        mode="Constant Velocity",
+    )
+
+    chi = math.radians(heading_deg)
+    gamma = math.radians(gamma_deg)
+    v = np.array(
+        [
+            V * math.cos(gamma) * math.cos(chi),
+            V * math.cos(gamma) * math.sin(chi),
+            V * math.sin(gamma),
+        ]
+    )
+    analytical_final = (
+        r0 + v * T
+    )
+    numerical_final = traj[
+        ["X (m)", "Y (m)", "Z (m)"]
+    ].iloc[-1].to_numpy(dtype=float)
+
+    cv_error_m = float(
+        np.linalg.norm(
+            numerical_final
+            - analytical_final
+        )
+    )
+
+    rows.append(
+        {
+            "Benchmark": "Constant-velocity position",
+            "Error": cv_error_m,
+            "Tolerance": 0.5,
+            "Units": "m",
+            "Status": "PASS"
+            if cv_error_m <= 0.5
+            else "FAIL",
+        }
+    )
+
+    # Benchmark 2: vacuum ballistic vertical displacement.
+    ballistic = generic_point_mass_flight_dynamics(
+        np.array([0.0, 0.0, 10000.0]),
+        300.0,
+        0.0,
+        30.0,
+        2.0,
+        0.002,
+        mode="Generic Ballistic Arc",
+    )
+
+    vz0 = 300.0 * math.sin(
+        math.radians(30.0)
+    )
+    z_expected = (
+        10000.0
+        + vz0 * 2.0
+        - 0.5 * 9.80665 * 2.0**2
+    )
+    z_numeric = float(
+        ballistic["Z (m)"].iloc[-1]
+    )
+    ballistic_error_m = abs(
+        z_numeric
+        - z_expected
+    )
+
+    rows.append(
+        {
+            "Benchmark": "Vacuum ballistic vertical motion",
+            "Error": ballistic_error_m,
+            "Tolerance": 1.0,
+            "Units": "m",
+            "Status": "PASS"
+            if ballistic_error_m <= 1.0
+            else "FAIL",
+        }
+    )
+
+    # Benchmark 3: coordinated-turn radius.
+    speed = 150.0
+    bank_deg = 30.0
+    expected_radius = (
+        speed**2
+        / (
+            9.80665
+            * math.tan(
+                math.radians(bank_deg)
+            )
+        )
+    )
+
+    turn = generic_point_mass_flight_dynamics(
+        np.array([0.0, 0.0, 1000.0]),
+        speed,
+        0.0,
+        0.0,
+        2.0,
+        0.005,
+        mode="Coordinated Turn",
+        bank_angle_deg=bank_deg,
+    )
+
+    final_heading = math.radians(
+        float(
+            turn["Heading (deg)"].iloc[-1]
+        )
+    )
+    numerical_turn_rate = (
+        final_heading / 2.0
+    )
+    numerical_radius = (
+        speed
+        / max(
+            abs(numerical_turn_rate),
+            1e-12,
+        )
+    )
+
+    turn_error_pct = (
+        abs(
+            numerical_radius
+            - expected_radius
+        )
+        / expected_radius
+        * 100.0
+    )
+
+    rows.append(
+        {
+            "Benchmark": "Coordinated-turn radius",
+            "Error": turn_error_pct,
+            "Tolerance": 1.0,
+            "Units": "%",
+            "Status": "PASS"
+            if turn_error_pct <= 1.0
+            else "FAIL",
+        }
+    )
 
     return pd.DataFrame(rows)
 
@@ -5448,6 +5975,82 @@ def run_internal_regression_checks():
     return pd.DataFrame(checks)
 
 
+
+# ============================================================
+# Aerospace regime / model-validity helpers
+# ============================================================
+
+def standard_atmosphere_speed_of_sound_mps(altitude_m: float) -> float:
+    """Low-order ISA speed-of-sound approximation for regime labeling."""
+    h = max(float(altitude_m), 0.0)
+    temperature_k = 288.15 - 0.0065 * h if h <= 11000.0 else 216.65
+    return math.sqrt(1.4 * 287.05 * temperature_k)
+
+
+def kinematic_regime_label(speed_mps: float, altitude_m: float):
+    a = standard_atmosphere_speed_of_sound_mps(altitude_m)
+    mach = float(speed_mps) / max(a, 1e-6)
+    if mach < 0.3:
+        regime = "Low-speed"
+    elif mach < 0.8:
+        regime = "Subsonic"
+    elif mach < 1.2:
+        regime = "Transonic"
+    elif mach < 5.0:
+        regime = "Supersonic"
+    else:
+        regime = "Hypersonic / outside low-order fidelity"
+    return regime, mach
+
+
+def recommended_solver_dt_s(speed_mps, range_m, los_rate_rad_s, track_update_hz):
+    """Generic numerical-resolution recommendation, independent of effect modeling."""
+    speed = max(float(speed_mps), 1e-6)
+    rng = max(float(range_m), 1.0)
+    los_rate = max(abs(float(los_rate_rad_s)), 1e-9)
+    update_hz = max(float(track_update_hz), 0.1)
+    dt_translation = 0.0025 * rng / speed
+    dt_angular = 0.00025 / los_rate
+    dt_tracking = 1.0 / (5.0 * update_hz)
+    return float(max(0.005, min(0.10, dt_translation, dt_angular, dt_tracking)))
+
+
+def model_validity_assessment(speed_mps, altitude_m, solver_dt_s, recommended_dt_s, track_update_hz, trajectory_mode="Constant Velocity"):
+    regime, mach = kinematic_regime_label(speed_mps, altitude_m)
+    solver_ok = float(solver_dt_s) <= float(recommended_dt_s) * 1.05
+
+    if speed_mps <= 350.0:
+        trajectory = "GOOD"
+    elif trajectory_mode == "Constant Velocity":
+        trajectory = "MARGINAL"
+    else:
+        trajectory = "CAUTION"
+
+    speed_scale = max(float(speed_mps) / 100.0, 1.0)
+    tracking_ratio = max(float(track_update_hz), 0.1) / speed_scale
+    if tracking_ratio >= 5.0:
+        tracking = "GOOD"
+    elif tracking_ratio >= 2.0:
+        tracking = "CAUTION"
+    else:
+        tracking = "MARGINAL"
+
+    if mach >= 5.0 or not solver_ok or trajectory == "MARGINAL":
+        overall = "MARGINAL"
+    elif tracking == "GOOD" and trajectory == "GOOD":
+        overall = "GOOD"
+    else:
+        overall = "CAUTION"
+
+    return {
+        "regime": regime,
+        "mach": mach,
+        "solver_status": "ADEQUATE" if solver_ok else "REFINE",
+        "trajectory_validity": trajectory,
+        "tracking_status": tracking,
+        "overall": overall,
+    }
+
 # ============================================================
 # UI
 # ============================================================
@@ -5660,12 +6263,36 @@ with st.sidebar:
         st.session_state.target_hardness_v4 = preset["hardness"]
         st.session_state._last_target_type_v4 = target_type
 
+    SPEED_ENVELOPES = {
+        "Small Multirotor UAS": (5.0, 120.0),
+        "Fixed-Wing UAS": (10.0, 220.0),
+        "Large UAS": (20.0, 300.0),
+        "Loitering Munition": (20.0, 350.0),
+        "Cruise-Missile-Like Target": (50.0, 350.0),
+        "Rocket / Artillery-Like Target": (50.0, 350.0),
+        "Helicopter-Like Target": (0.0, 120.0),
+        "Fixed-Wing Aircraft": (30.0, 350.0),
+        "Generic Airborne Target": (0.0, 350.0),
+    }
+    speed_min_mps, speed_max_mps = SPEED_ENVELOPES[target_type]
+
+    current_speed = float(st.session_state.get("target_speed_v4", preset["speed"]))
+    if current_speed < speed_min_mps or current_speed > speed_max_mps:
+        st.session_state.target_speed_v4 = float(
+            min(max(current_speed, speed_min_mps), speed_max_mps)
+        )
+
     speed_mps = st.slider(
         "Target speed (m/s)",
-        10.0,
-        350.0,
+        float(speed_min_mps),
+        float(speed_max_mps),
         key="target_speed_v4",
         step=5.0,
+        help=(
+            "Category-aware generic simulation envelope. The directed-energy effect "
+            "model remains intentionally limited to 350 m/s; higher-speed aerospace "
+            "cases are handled in the isolated Advanced Twin."
+        ),
     )
     velocity_angle_deg = st.slider(
         "Horizontal velocity angle relative to LOS (deg)",
@@ -5694,6 +6321,14 @@ with st.sidebar:
             "Descending trajectories terminate at the z=0 reference plane."
         ),
     )
+    target_regime_label, target_mach = kinematic_regime_label(
+        speed_mps,
+        initial_altitude_m,
+    )
+    regime_c1, regime_c2 = st.columns(2)
+    regime_c1.metric("Approx. Mach", f"M {target_mach:.2f}")
+    regime_c2.metric("Kinematic Regime", target_regime_label)
+
     aspect_factor = st.slider(
         "Aspect / observability factor",
         0.2,
@@ -6041,6 +6676,32 @@ timeline, result = simulate_time_stepped_engagement(
     dt_s=0.10,
 )
 
+los_rate_for_dt = float(result.get("LOS Rate (mrad/s)", 0.0)) / 1000.0
+recommended_dt = recommended_solver_dt_s(
+    tgt.speed_mps,
+    max(float(result.get("Range (km)", env.range_km)) * 1000.0, 1.0),
+    los_rate_for_dt,
+    sensors.track_update_hz,
+)
+validity = model_validity_assessment(
+    tgt.speed_mps,
+    tgt.initial_altitude_m,
+    0.10,
+    recommended_dt,
+    sensors.track_update_hz,
+)
+
+st.subheader("Aerospace Model Validity")
+mv1, mv2, mv3, mv4, mv5 = st.columns(5)
+mv1.metric("Kinematic Regime", validity["regime"])
+mv2.metric("Approx. Mach", f"M {validity['mach']:.2f}")
+mv3.metric("Recommended dt", f"{recommended_dt:.3f} s")
+mv4.metric("Solver Resolution", validity["solver_status"])
+mv5.metric("Overall Confidence", validity["overall"])
+st.caption(
+    "These flags assess numerical/model suitability, not target effectiveness. "
+    "The low-order effect model remains bounded to its current speed envelope."
+)
 
 # ============================================================
 # Engagement state
@@ -6957,6 +7618,33 @@ with tab8:
 
     with adv_col1:
         st.markdown("#### 3D Maneuvering Truth + Attitude Kinematics")
+        advanced_trajectory_mode = st.selectbox(
+            "Generic trajectory mode",
+            [
+                "Constant Velocity",
+                "Accelerating Translation",
+                "Coordinated Turn",
+                "Climb / Descent",
+                "Generic Ballistic Arc",
+            ],
+            key="advanced_trajectory_mode",
+            help=(
+                "Generic aerospace demonstration modes isolated from directed-energy "
+                "effect calculations."
+            ),
+        )
+        adv_speed_mps = st.slider(
+            "Advanced generic target speed (m/s)",
+            10.0,
+            1200.0,
+            float(min(max(tgt.speed_mps, 10.0), 1200.0)),
+            10.0,
+            key="adv_speed_mps",
+            help=(
+                "High-speed generic aerospace kinematics only. This does not expand "
+                "the directed-energy effect-model envelope."
+            ),
+        )
         adv_duration_s = st.slider(
             "Advanced twin duration (s)",
             2.0,
@@ -6973,6 +7661,35 @@ with tab8:
             0.01,
             key="adv_dt_s",
         )
+        adv_bank_angle_deg = st.slider(
+            "Bank angle for coordinated turn (deg)",
+            -60.0,
+            60.0,
+            25.0,
+            1.0,
+            key="adv_bank_angle_deg",
+            help=(
+                "Used by the formal 3-DOF coordinated-turn model through "
+                "chi_dot = g tan(phi) / (V cos(gamma))."
+            ),
+        )
+        adv_longitudinal_accel = st.slider(
+            "Longitudinal acceleration (m/s²)",
+            -15.0,
+            15.0,
+            0.0,
+            0.5,
+            key="adv_longitudinal_accel",
+        )
+        adv_flight_path_rate = st.slider(
+            "Flight-path-angle rate (deg/s)",
+            -10.0,
+            10.0,
+            0.0,
+            0.5,
+            key="adv_flight_path_rate",
+        )
+
         adv_lateral_accel = st.slider(
             "Generic lateral acceleration (m/s²)",
             -10.0,
@@ -7065,17 +7782,103 @@ with tab8:
             key="adv_platform_yaw",
         )
 
+    adv_velocity = target_velocity_vector_mps(tgt)
+    adv_velocity_norm = max(float(np.linalg.norm(adv_velocity)), 1e-9)
+    adv_velocity = adv_velocity / adv_velocity_norm * float(adv_speed_mps)
+
+    if advanced_trajectory_mode == "Accelerating Translation":
+        mode_lat_accel = adv_lateral_accel + 2.0
+        mode_vert_accel = adv_vertical_accel
+    elif advanced_trajectory_mode == "Coordinated Turn":
+        mode_lat_accel = adv_lateral_accel + 4.0
+        mode_vert_accel = adv_vertical_accel
+    elif advanced_trajectory_mode == "Climb / Descent":
+        mode_lat_accel = adv_lateral_accel
+        mode_vert_accel = adv_vertical_accel + (-2.0 if tgt.flight_path_angle_deg < 0.0 else 2.0)
+    elif advanced_trajectory_mode == "Generic Ballistic Arc":
+        mode_lat_accel = adv_lateral_accel
+        mode_vert_accel = adv_vertical_accel - 9.81
+    else:
+        mode_lat_accel = adv_lateral_accel
+        mode_vert_accel = adv_vertical_accel
+
+    adv_recommended_dt = recommended_solver_dt_s(
+        adv_speed_mps,
+        max(env.range_km * 1000.0, 1.0),
+        0.001,
+        sensors.track_update_hz,
+    )
+    adv_validity = model_validity_assessment(
+        adv_speed_mps,
+        tgt.initial_altitude_m,
+        adv_dt_s,
+        adv_recommended_dt,
+        sensors.track_update_hz,
+        trajectory_mode=advanced_trajectory_mode,
+    )
+    av1, av2, av3, av4 = st.columns(4)
+    av1.metric("Approx. Mach", f"M {adv_validity['mach']:.2f}")
+    av2.metric("Solver Resolution", adv_validity["solver_status"])
+    av3.metric("Trajectory Validity", adv_validity["trajectory_validity"])
+    av4.metric("Overall Confidence", adv_validity["overall"])
+
     adv_truth = generic_maneuvering_truth_attitude_kinematics(
         target_initial_position_m(env, tgt),
-        target_velocity_vector_mps(tgt),
+        adv_velocity,
         adv_duration_s,
-        adv_dt_s,
-        adv_lateral_accel,
-        adv_vertical_accel,
+        min(adv_dt_s, adv_recommended_dt),
+        mode_lat_accel,
+        mode_vert_accel,
         adv_yaw_rate,
         adv_pitch_rate,
         adv_roll_rate,
     )
+
+    formal_point_mass_truth = generic_point_mass_flight_dynamics(
+        initial_position_m=target_initial_position_m(
+            env,
+            tgt,
+        ),
+        initial_speed_mps=float(adv_speed_mps),
+        initial_heading_deg=math.degrees(
+            math.atan2(
+                adv_velocity[1],
+                adv_velocity[0],
+            )
+        ),
+        initial_flight_path_deg=tgt.flight_path_angle_deg,
+        duration_s=adv_duration_s,
+        dt_s=min(
+            adv_dt_s,
+            adv_recommended_dt,
+        ),
+        mode=advanced_trajectory_mode,
+        bank_angle_deg=adv_bank_angle_deg,
+        longitudinal_accel_mps2=adv_longitudinal_accel,
+        flight_path_rate_deg_s=adv_flight_path_rate,
+    )
+
+    # Use the formal 3-DOF point-mass trajectory as the Advanced Twin truth
+    # whenever available. The older maneuvering/attitude-kinematics dataframe
+    # remains available as a separate educational reference model.
+    adv_truth_for_sensing = (
+        formal_point_mass_truth.rename(
+            columns={
+                "Heading (deg)": "Yaw (deg)",
+                "Flight Path Angle (deg)": "Pitch (deg)",
+            }
+        )
+    )
+
+    for axis in [
+        "VX (m/s)",
+        "VY (m/s)",
+        "VZ (m/s)",
+    ]:
+        if axis not in adv_truth_for_sensing.columns:
+            adv_truth_for_sensing[axis] = np.nan
+
+
 
     adv_platform_motion = GenericPlatformMotion(
         speed_mps=platform_speed,
@@ -7132,7 +7935,7 @@ with tab8:
         )
 
     adv_measurements = generic_sensor_measurements(
-        adv_truth,
+        adv_truth_for_sensing,
         adv_platform,
         adv_range_sigma,
         adv_az_sigma,
@@ -7151,7 +7954,7 @@ with tab8:
     # The underlying truth, platform, and measurement states are unchanged.
     advanced_plot_x = np.concatenate(
         [
-            adv_truth["X (m)"].to_numpy(dtype=float),
+            adv_truth_for_sensing["X (m)"].to_numpy(dtype=float),
             adv_platform["X (m)"].to_numpy(dtype=float),
             valid_recon["Estimated X (m)"].to_numpy(dtype=float)
             if not valid_recon.empty
@@ -7160,7 +7963,7 @@ with tab8:
     )
     advanced_plot_y = np.concatenate(
         [
-            adv_truth["Y (m)"].to_numpy(dtype=float),
+            adv_truth_for_sensing["Y (m)"].to_numpy(dtype=float),
             adv_platform["Y (m)"].to_numpy(dtype=float),
             valid_recon["Estimated Y (m)"].to_numpy(dtype=float)
             if not valid_recon.empty
@@ -7169,7 +7972,7 @@ with tab8:
     )
     advanced_plot_z = np.concatenate(
         [
-            adv_truth["Z (m)"].to_numpy(dtype=float),
+            adv_truth_for_sensing["Z (m)"].to_numpy(dtype=float),
             adv_platform["Z (m)"].to_numpy(dtype=float),
             valid_recon["Estimated Z (m)"].to_numpy(dtype=float)
             if not valid_recon.empty
@@ -7206,9 +8009,9 @@ with tab8:
     truth_plot = go.Figure()
     truth_plot.add_trace(
         go.Scatter3d(
-            x=adv_truth["X (m)"] / 1000.0,
-            y=adv_truth["Y (m)"] / 1000.0,
-            z=adv_truth["Z (m)"] / 1000.0,
+            x=adv_truth_for_sensing["X (m)"] / 1000.0,
+            y=adv_truth_for_sensing["Y (m)"] / 1000.0,
+            z=adv_truth_for_sensing["Z (m)"] / 1000.0,
             mode="lines",
             name="Maneuvering Truth",
         )
@@ -7273,7 +8076,7 @@ with tab8:
         config={"responsive": True, "displaylogo": False},
     )
 
-    st.markdown("#### Layered Atmospheric Visibility Demonstration")
+    st.markdown("#### Profile-Aware Atmospheric Visibility Demonstration")
     final_truth = adv_truth.iloc[-1]
     final_platform = adv_platform.iloc[min(len(adv_platform) - 1, len(adv_truth) - 1)]
     final_rel = np.array(
@@ -7284,12 +8087,13 @@ with tab8:
         ]
     )
     adv_slant_km = float(np.linalg.norm(final_rel) / 1000.0)
-    layered_vis = layered_visibility_index(
-        adv_slant_km,
-        float(final_truth["Z (m)"]),
-        env.visibility_km,
-        env.humidity_pct,
-        layers=24,
+    layered_vis = profile_aware_visibility_index(
+        slant_range_km=adv_slant_km,
+        platform_altitude_m=float(final_platform["Z (m)"]),
+        target_altitude_m=float(final_truth["Z (m)"]),
+        surface_visibility_km=env.visibility_km,
+        surface_humidity_pct=env.humidity_pct,
+        layers=48,
     )
 
     lv1, lv2, lv3 = st.columns(3)
@@ -7298,18 +8102,18 @@ with tab8:
     lv3.metric("Layered Visibility Index", f"{layered_vis['visibility_index']:.1%}")
 
     st.caption(
-        "The layered atmosphere here is a generic visibility/sensor demonstration only. "
+        "The profile-aware atmosphere integrates altitude-varying aerosol, humidity, and molecular extinction. "
         "It does not replace the existing directed-energy propagation model."
     )
 
     st.markdown("#### Generic Second-Order Sensor/Gimbal Dynamics")
     if len(adv_truth) > 1:
         rel_x = (
-            adv_truth["X (m)"].to_numpy()
+            adv_truth_for_sensing["X (m)"].to_numpy()
             - adv_platform["X (m)"].to_numpy()[:len(adv_truth)]
         )
         rel_y = (
-            adv_truth["Y (m)"].to_numpy()
+            adv_truth_for_sensing["Y (m)"].to_numpy()
             - adv_platform["Y (m)"].to_numpy()[:len(adv_truth)]
         )
 
@@ -7376,7 +8180,7 @@ with tab8:
 
     gimbal_df = pd.DataFrame(
         {
-            "Time (s)": adv_truth["Time (s)"].to_numpy()[:len(gimbal_az_deg)],
+            "Time (s)": adv_truth_for_sensing["Time (s)"].to_numpy()[:len(gimbal_az_deg)],
             "Command Azimuth (deg)": command_az_deg[:len(gimbal_az_deg)],
             "Gimbal Azimuth (deg)": gimbal_az_deg,
         }
@@ -7386,9 +8190,29 @@ with tab8:
         width="stretch",
     )
 
+    st.markdown("#### Analytical V&V Benchmarks")
+    benchmark_df = analytical_vv_benchmarks()
+    st.dataframe(
+        benchmark_df,
+        width="stretch",
+        hide_index=True,
+    )
+    benchmark_pass = bool(
+        (
+            benchmark_df["Status"]
+            == "PASS"
+        ).all()
+    )
+    st.metric(
+        "Analytical Benchmark Status",
+        "PASS"
+        if benchmark_pass
+        else "CHECK",
+    )
+
     st.markdown("#### Verification & Validation")
     if st.button(
-        "Run Timestep Convergence Check",
+        "Run Quantitative Timestep Convergence Check",
         key="run_vv_convergence",
         width="stretch",
     ):
@@ -7802,5 +8626,5 @@ st.caption(
     "None of these models constitute validated "
     "operational weapon-performance, lethality, or probability-of-kill predictions. "
     "The current target preset library spans multiple generic airborne target classes, "
-    "and the target-speed envelope remains intentionally limited to 350 m/s."
+    "and the directed-energy effect-model target-speed envelope remains intentionally limited to 350 m/s; higher-speed generic aerospace kinematics are isolated in the Advanced Twin."
 )
