@@ -6162,7 +6162,7 @@ with tab1:
         stage_df.style.format({
             "State / Confidence": "{:.1%}"
         }),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -6241,7 +6241,7 @@ with tab1:
 
     st.dataframe(
         state_table,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -6313,7 +6313,7 @@ with tab2:
 
     st.dataframe(
         uncertainty_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -6475,7 +6475,7 @@ with tab4:
 
         st.dataframe(
             summary,
-            use_container_width=True,
+            width="stretch",
         )
 
         csv = mc.to_csv(
@@ -6623,7 +6623,7 @@ with tab6:
 
         st.plotly_chart(
             twin_3d,
-            use_container_width=True,
+            width="stretch",
             config={
                 "displaylogo": False,
                 "scrollZoom": True,
@@ -6718,7 +6718,7 @@ with tab6:
 
         st.dataframe(
             engagement_readout,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -6872,7 +6872,7 @@ with tab7:
             timeline_csv,
             file_name="directed_energy_time_history.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     with e2:
@@ -6881,7 +6881,7 @@ with tab7:
             scenario_json,
             file_name="directed_energy_scenario_final_state.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
     mc_export = st.session_state.get("directed_energy_mc_results")
@@ -6893,7 +6893,7 @@ with tab7:
             mc_csv,
             file_name="directed_energy_monte_carlo.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         st.caption(
             f"Latest Monte Carlo export contains {len(mc_export):,} simulation runs."
@@ -6906,7 +6906,7 @@ with tab7:
     st.markdown("#### Time-History Export Preview")
     st.dataframe(
         export_timeline.head(25),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -6935,7 +6935,7 @@ with tab7:
     )
     st.dataframe(
         export_metadata,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -7191,7 +7191,7 @@ with tab8:
     )
     st.plotly_chart(
         truth_plot,
-        use_container_width=True,
+        width="stretch",
         config={"responsive": True, "displaylogo": False},
     )
 
@@ -7305,14 +7305,14 @@ with tab8:
     )
     st.line_chart(
         gimbal_df.set_index("Time (s)"),
-        use_container_width=True,
+        width="stretch",
     )
 
     st.markdown("#### Verification & Validation")
     if st.button(
         "Run Timestep Convergence Check",
         key="run_vv_convergence",
-        use_container_width=True,
+        width="stretch",
     ):
         convergence_df = timestep_convergence_study(
             env,
@@ -7327,7 +7327,7 @@ with tab8:
     if isinstance(convergence_df, pd.DataFrame):
         st.dataframe(
             convergence_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -7358,7 +7358,7 @@ with tab8:
             adv_truth_csv,
             file_name="advanced_maneuvering_truth.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
     with ex2:
         st.download_button(
@@ -7366,7 +7366,7 @@ with tab8:
             adv_meas_csv,
             file_name="advanced_generic_sensor_measurements.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -7475,7 +7475,7 @@ with tab9:
         )
         ekf_metrics[2].metric(
             "Measurement Updates",
-            f"{int(np.isfinite(est_eval['NIS']).sum())}",
+            f"{int(np.isfinite(aligned_eval['NIS']).sum())}",
         )
         finite_nis = aligned_eval["NIS"].dropna()
         ekf_metrics[3].metric(
@@ -7515,13 +7515,13 @@ with tab9:
         )
         st.plotly_chart(
             ekf_plot,
-            use_container_width=True,
+            width="stretch",
             config={"responsive": True, "displaylogo": False},
         )
 
         st.dataframe(
             ekf_track.tail(25),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     else:
@@ -7586,7 +7586,7 @@ with tab9:
     )
     st.dataframe(
         req_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -7627,7 +7627,7 @@ with tab9:
 
     st.dataframe(
         trade_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -7657,14 +7657,14 @@ with tab9:
     )
     st.plotly_chart(
         trade_plot,
-        use_container_width=True,
+        width="stretch",
         config={"responsive": True, "displaylogo": False},
     )
 
     st.markdown("#### Model Provenance")
     st.dataframe(
         model_provenance_table(),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -7672,7 +7672,7 @@ with tab9:
     regression_df = run_internal_regression_checks()
     st.dataframe(
         regression_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -7705,7 +7705,7 @@ with tab9:
         lab_json,
         file_name="directed_energy_engineering_lab.json",
         mime="application/json",
-        use_container_width=True,
+        width="stretch",
     )
 
 
