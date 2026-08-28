@@ -6374,7 +6374,7 @@ def model_provenance_table():
             {
                 "Subsystem": "Atmosphere",
                 "Model type": "Phenomenological / Beer-Lambert",
-                "Validation status": "Not validated against MODTRAN/test data",
+                "Validation status": "Atmospheric state can be checked against NOAA IGRA; optical propagation is not validated against MODTRAN or beam-test data",
                 "Intended use": "Sensitivity and systems trade studies",
             },
             {
@@ -6386,7 +6386,7 @@ def model_provenance_table():
             {
                 "Subsystem": "Target thermal response",
                 "Model type": "Generic lumped areal thermal index",
-                "Validation status": "Not a lethality/damage model",
+                "Validation status": "Engineering thermal/effect indicator; not empirically validated for lethality or component damage",
                 "Intended use": "Non-operational engineering indicator",
             },
         ]
@@ -8171,7 +8171,8 @@ st.caption(
     "Low-order, non-classified digital engineering prototype. "
     "The model now includes Kalman covariance propagation, Beer-Lambert atmospheric "
     "extinction, and a lumped target thermal-response model. Outputs remain generic "
-    "engineering estimates, not validated weapon-performance predictions."
+    "engineering simulation estimates. NASA GTM and NOAA comparisons validate only the specific states, atmospheric "
+    "variables, cases, and regimes actually evaluated; they do not establish general weapon-performance validity."
 )
 
 
@@ -8361,9 +8362,10 @@ with st.sidebar:
         key="target_speed_v4",
         step=5.0,
         help=(
-            "Category-aware generic simulation envelope. The directed-energy effect "
-            "model remains intentionally limited to 350 m/s; higher-speed aerospace "
-            "cases are handled in the isolated Advanced Twin."
+            "Category-aware generic simulation envelope. Target-speed applicability "
+            "depends on the active model configuration and demonstrated validation regime. "
+            "The Advanced Twin supports higher-fidelity 3-DOF/6-DOF aerospace kinematics; "
+            "results outside validated cases remain engineering simulation outputs."
         ),
     )
     velocity_angle_deg = st.slider(
@@ -9408,7 +9410,7 @@ with tab6:
         st.caption(
             "These values describe the modeled target state at the currently selected "
             "3-D timestep. The Thermal Effect Index is a normalized engineering metric, "
-            "not a probability of kill or validated damage prediction."
+            "an engineering thermal-effect indicator, not a validated probability-of-kill or component-damage prediction."
         )
 
         engagement_readout = pd.DataFrame(
@@ -11896,10 +11898,10 @@ with tab10:
             orient="records"
         ),
         "limitations": [
-            "Validation applies only to the compared regimes and variables.",
+            "Validation applies only to the specific compared regimes, variables, and reference cases.",
             "NASA GTM comparison does not imply the generic vehicle equals the GTM aircraft.",
             "NOAA radiosonde comparison does not validate directed-energy optical effects.",
-            "No lethality or probability-of-kill validation is claimed.",
+            "Thermal/effect outputs are engineering indicators; no empirical lethality or probability-of-kill validation is claimed.",
         ],
     }
 
@@ -11962,5 +11964,7 @@ st.caption(
     "None of these models constitute validated "
     "operational weapon-performance, lethality, or probability-of-kill predictions. "
     "The current target preset library spans multiple generic airborne target classes, "
-    "and the directed-energy effect-model target-speed envelope remains intentionally limited to 350 m/s; higher-speed generic aerospace kinematics are isolated in the Advanced Twin."
+    "and target-speed applicability is governed by the active model configuration and demonstrated validation regime. "
+"The Advanced Twin supports higher-fidelity generic aerospace kinematics, including 6-DOF rigid-body propagation; "
+"results outside matched or observationally validated cases remain engineering simulation outputs."
 )
