@@ -1,3 +1,4 @@
+import json
 import math
 import random
 from dataclasses import dataclass, asdict
@@ -5164,7 +5165,7 @@ else:
     st.error(result["Recommendation"])
 
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     [
         "Engagement Loop",
         "State Estimation",
@@ -5172,6 +5173,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         "Monte Carlo",
         "Model State",
         "3D Digital Twin",
+        "Export",
     ]
 )
 
@@ -5492,6 +5494,7 @@ with tab4:
         ]
 
         mc = pd.DataFrame(records)
+        st.session_state["directed_energy_mc_results"] = mc.copy()
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric(
@@ -5728,6 +5731,192 @@ with tab6:
         st.info(
             "No finite engagement timeline is available for the current scenario."
         )
+
+
+
+# ============================================================
+# Export
+# ============================================================
+
+with tab7:
+    st.markdown("### Export Simulation Data")
+    st.caption(
+        "Exports are generated from the same authoritative 3-D engagement state used "
+        "by the dashboard and digital twin. Export operations do not modify the model."
+    )
+
+    preferred_columns = [
+        "Time (s)",
+        "Range (km)",
+        "Physics Evaluation Range (km)",
+        "X (km)",
+        "Y (km)",
+        "Z (km)",
+        "Altitude (m)",
+        "Azimuth (deg)",
+        "Elevation Angle (deg)",
+        "Detection Probability",
+        "Classification Confidence",
+        "Measurement Availability",
+        "Track Quality",
+        "Track Radial 1σ (m)",
+        "Track Azimuth Cross-Range 1σ (m)",
+        "Track Elevation Cross-Range 1σ (m)",
+        "Track Angular 1σ (mrad)",
+        "Track Azimuth 1σ (mrad)",
+        "Track Elevation 1σ (mrad)",
+        "LOS Rate (mrad/s)",
+        "Azimuth LOS Rate (mrad/s)",
+        "Elevation LOS Rate (mrad/s)",
+        "Aimpoint Margin Index",
+        "Atmospheric Transmission",
+        "Aerosol Extinction (1/km)",
+        "Rayleigh Extinction (1/km)",
+        "Humidity Extinction (1/km)",
+        "Optical Depth",
+        "Available Engagement Time (s)",
+        "Time to CPA (s)",
+        "Time to Ground Impact (s)",
+        "CPA Range (m)",
+        "Effective Dwell Time (s)",
+        "Requested Optical Source Power (kW)",
+        "Actual Optical Source Power (kW)",
+        "Requested Electrical Input (kW)",
+        "Actual Electrical Input (kW)",
+        "Power Availability Ratio",
+        "Generator Contribution (kW)",
+        "Storage Draw (kW)",
+        "Target Optical Power (kW)",
+        "Diffraction Half-Angle (mrad)",
+        "Effective Beam Half-Angle (mrad)",
+        "Effective Pointing Error (mrad)",
+        "Stochastic Pointing 1σ (mrad)",
+        "Servo Tracking Error (mrad)",
+        "Azimuth Servo Error (mrad)",
+        "Elevation Servo Error (mrad)",
+        "Beam Director Rate Utilization",
+        "Beam Director Rate Demand Ratio",
+        "Beam Director Rate Saturated",
+        "Spot Diameter (m)",
+        "Average Irradiance (kW/m^2)",
+        "Absorbed Heat Flux (kW/m^2)",
+        "Absorbed Exposure (kJ/m^2)",
+        "Target ΔT (C)",
+        "Target Surface Temp (C)",
+        "Estimated Thermal Effect Index",
+        "Coolant Temp (C)",
+        "Thermal Margin",
+        "Energy Margin",
+        "Storage Energy Used (kWh)",
+        "Stored Energy Remaining (kWh)",
+        "Readiness Score",
+        "Recommendation",
+    ]
+
+    export_columns = [
+        col for col in preferred_columns
+        if col in timeline.columns
+    ]
+    export_timeline = timeline[export_columns].copy()
+
+    timeline_csv = export_timeline.to_csv(index=False).encode("utf-8")
+
+    export_package = {
+        "schema_version": "1.0",
+        "model": "Directed Energy Engagement Digital Twin",
+        "model_scope": (
+            "Low-order, non-classified digital engineering prototype. "
+            "Outputs are generic engineering estimates and are not validated "
+            "weapon-performance predictions."
+        ),
+        "environment": asdict(env),
+        "target": asdict(tgt),
+        "sensor_state": asdict(sensors),
+        "hel_state": asdict(hel),
+        "platform_state": asdict(platform),
+        "final_engagement_state": result,
+    }
+
+    scenario_json = json.dumps(
+        export_package,
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    e1, e2 = st.columns(2)
+
+    with e1:
+        st.download_button(
+            "Download Time-History CSV",
+            timeline_csv,
+            file_name="directed_energy_time_history.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    with e2:
+        st.download_button(
+            "Download Scenario + Final State JSON",
+            scenario_json,
+            file_name="directed_energy_scenario_final_state.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    mc_export = st.session_state.get("directed_energy_mc_results")
+
+    if isinstance(mc_export, pd.DataFrame) and not mc_export.empty:
+        mc_csv = mc_export.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download Latest Monte Carlo CSV",
+            mc_csv,
+            file_name="directed_energy_monte_carlo.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption(
+            f"Latest Monte Carlo export contains {len(mc_export):,} simulation runs."
+        )
+    else:
+        st.info(
+            "Run the Monte Carlo analysis to enable the Monte Carlo CSV export."
+        )
+
+    st.markdown("#### Time-History Export Preview")
+    st.dataframe(
+        export_timeline.head(25),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("#### Export Metadata")
+    export_metadata = pd.DataFrame(
+        {
+            "Item": [
+                "Target type",
+                "Initial horizontal range",
+                "Initial altitude",
+                "Flight-path angle",
+                "Commanded dwell",
+                "Timeline rows",
+                "Final recommendation",
+            ],
+            "Value": [
+                tgt.target_type,
+                f"{env.range_km:.2f} km",
+                f"{tgt.initial_altitude_m:.0f} m",
+                f"{tgt.flight_path_angle_deg:.1f}°",
+                f"{hel.commanded_dwell_time_s:.2f} s",
+                f"{len(export_timeline):,}",
+                result["Recommendation"],
+            ],
+        }
+    )
+    st.dataframe(
+        export_metadata,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 st.divider()
