@@ -8624,11 +8624,51 @@ with tab8:
         pitch_deg=platform_pitch,
         yaw_deg=platform_yaw,
     )
+    # Keep platform truth on exactly the same time grid as the active
+    # Advanced Twin truth model. The 6-DOF solver can run at a finer timestep
+    # than the UI-selected adv_dt_s, so using adv_dt_s here can create unequal
+    # vector lengths and timestamp misalignment downstream.
+    if len(adv_truth_for_sensing) > 1:
+        adv_platform_dt_s = float(
+            np.median(
+                np.diff(
+                    adv_truth_for_sensing["Time (s)"].to_numpy(dtype=float)
+                )
+            )
+        )
+    else:
+        adv_platform_dt_s = float(adv_dt_s)
+
     adv_platform = moving_platform_truth(
         adv_duration_s,
-        adv_dt_s,
+        max(adv_platform_dt_s, 0.001),
         adv_platform_motion,
     )
+
+    # Defensive timestamp alignment. This also protects future truth models
+    # whose integration grid is nonuniform.
+    truth_time_grid = adv_truth_for_sensing["Time (s)"].to_numpy(dtype=float)
+    platform_time_grid = adv_platform["Time (s)"].to_numpy(dtype=float)
+
+    if (
+        len(adv_platform) != len(adv_truth_for_sensing)
+        or not np.allclose(
+            platform_time_grid[:min(len(platform_time_grid), len(truth_time_grid))],
+            truth_time_grid[:min(len(platform_time_grid), len(truth_time_grid))],
+            rtol=0.0,
+            atol=1e-9,
+        )
+    ):
+        aligned_platform = {"Time (s)": truth_time_grid}
+        for column in adv_platform.columns:
+            if column == "Time (s)":
+                continue
+            aligned_platform[column] = np.interp(
+                truth_time_grid,
+                platform_time_grid,
+                adv_platform[column].to_numpy(dtype=float),
+            )
+        adv_platform = pd.DataFrame(aligned_platform)
 
     st.markdown("#### Generic Sensor Measurement Simulation")
 
@@ -8813,8 +8853,8 @@ with tab8:
     )
 
     st.markdown("#### Profile-Aware Atmospheric Visibility Demonstration")
-    final_truth = adv_truth.iloc[-1]
-    final_platform = adv_platform.iloc[min(len(adv_platform) - 1, len(adv_truth) - 1)]
+    final_truth = adv_truth_for_sensing.iloc[-1]
+    final_platform = adv_platform.iloc[-1]
     final_rel = np.array(
         [
             final_truth["X (m)"] - final_platform["X (m)"],
@@ -8843,14 +8883,16 @@ with tab8:
     )
 
     st.markdown("#### Generic Second-Order Sensor/Gimbal Dynamics")
-    if len(adv_truth) > 1:
+    if len(adv_truth_for_sensing) > 1:
+        # Truth and platform arrays are timestamp-aligned above, so the LOS
+        # command is formed sample-for-sample without unsafe broadcasting.
         rel_x = (
-            adv_truth_for_sensing["X (m)"].to_numpy()
-            - adv_platform["X (m)"].to_numpy()[:len(adv_truth)]
+            adv_truth_for_sensing["X (m)"].to_numpy(dtype=float)
+            - adv_platform["X (m)"].to_numpy(dtype=float)
         )
         rel_y = (
-            adv_truth_for_sensing["Y (m)"].to_numpy()
-            - adv_platform["Y (m)"].to_numpy()[:len(adv_truth)]
+            adv_truth_for_sensing["Y (m)"].to_numpy(dtype=float)
+            - adv_platform["Y (m)"].to_numpy(dtype=float)
         )
 
         command_az_rad = np.unwrap(
@@ -8907,7 +8949,7 @@ with tab8:
 
     gimbal_az_deg = second_order_gimbal_response(
         command_az_deg,
-        adv_dt_s,
+        adv_platform_dt_s,
         adv_gimbal_fn,
         adv_gimbal_zeta,
         adv_gimbal_rate,
@@ -9036,7 +9078,7 @@ with tab8:
         )
 
     st.markdown("#### Advanced Twin Data Export")
-    adv_truth_csv = adv_truth.to_csv(index=False).encode("utf-8")
+    adv_truth_csv = adv_truth_for_sensing.to_csv(index=False).encode("utf-8")
     adv_meas_csv = adv_measurements.to_csv(index=False).encode("utf-8")
 
     ex1, ex2 = st.columns(2)
@@ -9100,7 +9142,7 @@ with tab9:
     if not ekf_track.empty:
         # Align estimator states with truth by timestamp so dropout before
         # initialization cannot shift the RMSE or plotted trajectories.
-        truth_for_eval = adv_truth[
+        truth_for_eval = adv_truth_for_sensing[
             [
                 "Time (s)",
                 "X (m)",
