@@ -1914,6 +1914,585 @@ def target_thermal_response(
     }
 
 
+
+# ============================================================
+# Thermal & Power Digital Twin
+# ============================================================
+
+def default_component_thermal_table(
+    platform: PlatformState,
+    env: Environment,
+) -> pd.DataFrame:
+    """Default generic component-level thermal network."""
+    base = max(float(platform.coolant_temp_c), float(env.ambient_temp_c))
+    limit = float(platform.thermal_limit_c)
+    rows = [
+        ("Laser Source", base + 4.0, 450.0, max(limit - 4.0, base + 10.0), 0.38),
+        ("Beam Director / Optics", base + 2.0, 260.0, max(limit - 8.0, base + 8.0), 0.14),
+        ("Power Electronics", base + 3.0, 320.0, max(limit - 5.0, base + 10.0), 0.28),
+        ("Energy Store", base + 1.0, 900.0, max(limit - 12.0, base + 8.0), 0.05),
+        ("Coolant Loop", base, max(platform.thermal_capacitance_kj_per_c * 0.60, 150.0), limit, 0.10),
+        ("Heat Exchanger", max(base - 1.0, env.ambient_temp_c), 500.0, limit, 0.05),
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "Component",
+            "Initial Temp (C)",
+            "Heat Capacity (kJ/K)",
+            "Temperature Limit (C)",
+            "Heat Load Fraction",
+        ],
+    )
+
+
+def _thermal_edge_conductance_kw_per_k() -> dict[tuple[str, str], float]:
+    """Generic thermal conductances between modeled platform nodes [kW/K]."""
+    return {
+        ("Laser Source", "Coolant Loop"): 1.80,
+        ("Beam Director / Optics", "Coolant Loop"): 1.00,
+        ("Power Electronics", "Coolant Loop"): 1.50,
+        ("Energy Store", "Coolant Loop"): 0.35,
+        ("Coolant Loop", "Heat Exchanger"): 3.00,
+    }
+
+
+def simulate_component_thermal_network(
+    platform: PlatformState,
+    env: Environment,
+    result: dict,
+    component_table: pd.DataFrame,
+    duration_s: float,
+    dt_s: float,
+    load_scale: float = 1.0,
+    cooling_command: float = 1.0,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Generic multi-node thermal network:
+
+        C_i dT_i/dt = Q_i - sum_j G_ij (T_i - T_j) - Q_sink,i
+
+    C_i is in kJ/K, G_ij in kW/K, and heat rates are in kW.
+    This model augments the primary low-order platform thermal state and is
+    intended for architecture, margin, cooldown, and trade studies.
+    """
+    if component_table is None or component_table.empty:
+        component_table = default_component_thermal_table(platform, env)
+
+    required = {
+        "Component",
+        "Initial Temp (C)",
+        "Heat Capacity (kJ/K)",
+        "Temperature Limit (C)",
+        "Heat Load Fraction",
+    }
+    missing = required.difference(component_table.columns)
+    if missing:
+        raise ValueError(f"Component thermal table is missing columns: {sorted(missing)}")
+
+    table = component_table.copy()
+    names = table["Component"].astype(str).tolist()
+    index = {name: i for i, name in enumerate(names)}
+    n = len(names)
+
+    T = table["Initial Temp (C)"].astype(float).to_numpy()
+    C = np.maximum(table["Heat Capacity (kJ/K)"].astype(float).to_numpy(), 1e-6)
+    limits = table["Temperature Limit (C)"].astype(float).to_numpy()
+    fractions = np.maximum(table["Heat Load Fraction"].astype(float).to_numpy(), 0.0)
+    fractions = (
+        fractions / fractions.sum()
+        if float(fractions.sum()) > 0.0
+        else np.full(n, 1.0 / max(n, 1))
+    )
+
+    duration_s = max(float(duration_s), 0.1)
+    dt_s = min(max(float(dt_s), 0.01), duration_s)
+    load_scale = max(float(load_scale), 0.0)
+    cooling_command = clamp(float(cooling_command), 0.0, 1.0)
+
+    internal_heat_kw = max(float(result.get("Internal Heat (kW)", 0.0)), 0.0) * load_scale
+    storage_draw_kw = max(float(result.get("Storage Draw (kW)", 0.0)), 0.0) * load_scale
+
+    q_external = internal_heat_kw * fractions
+    if "Energy Store" in index:
+        q_external[index["Energy Store"]] += 0.015 * storage_draw_kw
+
+    G = np.zeros((n, n), dtype=float)
+    for (a, b), g in _thermal_edge_conductance_kw_per_k().items():
+        if a in index and b in index:
+            i, j = index[a], index[b]
+            G[i, j] = G[j, i] = max(float(g), 0.0)
+
+    row_conductance = G.sum(axis=1)
+    positive = row_conductance > 1e-12
+    if np.any(positive):
+        tau_min = float(np.min(C[positive] / row_conductance[positive]))
+        stable_dt = min(0.20 * tau_min, dt_s)
+    else:
+        stable_dt = dt_s
+
+    if not math.isfinite(stable_dt) or stable_dt <= 0.0:
+        raise ValueError(
+            "Component thermal network produced a non-positive stable timestep."
+        )
+
+    output_times = np.arange(0.0, duration_s + 0.5 * dt_s, dt_s)
+    rows = []
+    t = 0.0
+    next_out = 0
+
+    def record_state(time_s: float, temperatures: np.ndarray, sink_kw: float):
+        row = {
+            "Time (s)": float(time_s),
+            "Cooling Sink (kW)": float(sink_kw),
+            "Internal Heat Input (kW)": float(internal_heat_kw),
+        }
+        for i, name in enumerate(names):
+            row[f"{name} Temp (C)"] = float(temperatures[i])
+        rows.append(row)
+
+    record_state(0.0, T, 0.0)
+    next_out = 1
+
+    while t < duration_s - 1e-12:
+        h = min(stable_dt, duration_s - t)
+        q_net = q_external.copy()
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if G[i, j] <= 0.0:
+                    continue
+                q_ij = G[i, j] * (T[i] - T[j])
+                q_net[i] -= q_ij
+                q_net[j] += q_ij
+
+        sink_kw = 0.0
+        if "Heat Exchanger" in index:
+            hx = index["Heat Exchanger"]
+            head_c = max(T[hx] - float(env.ambient_temp_c), 0.0)
+            reference_head_c = max(
+                float(platform.thermal_limit_c) - float(env.ambient_temp_c),
+                1.0,
+            )
+            effectiveness = clamp(head_c / reference_head_c)
+            sink_kw = (
+                max(float(platform.cooling_capacity_kw), 0.0)
+                * cooling_command
+                * effectiveness
+            )
+            q_net[hx] -= sink_kw
+
+        T = T + h * q_net / C
+        T = np.maximum(T, float(env.ambient_temp_c) - 20.0)
+        t += h
+
+        while next_out < len(output_times) and t >= output_times[next_out] - 1e-10:
+            record_state(output_times[next_out], T, sink_kw)
+            next_out += 1
+
+    history = pd.DataFrame(rows)
+    peak_temps = {
+        name: float(history[f"{name} Temp (C)"].max())
+        for name in names
+    }
+    margins_c = {
+        name: float(limits[index[name]] - peak_temps[name])
+        for name in names
+    }
+    min_margin_c = min(margins_c.values()) if margins_c else float("nan")
+    limiting_component = min(margins_c, key=margins_c.get) if margins_c else "N/A"
+
+    time_to_limit_s = float("nan")
+    first_limit_component = None
+    for name in names:
+        series = history[f"{name} Temp (C)"].to_numpy(dtype=float)
+        threshold = limits[index[name]]
+        hits = np.flatnonzero(series >= threshold)
+        if hits.size:
+            candidate = float(history["Time (s)"].iloc[int(hits[0])])
+            if (
+                first_limit_component is None
+                or candidate < time_to_limit_s
+            ):
+                time_to_limit_s = candidate
+                first_limit_component = name
+
+    time_to_limit_observed = first_limit_component is not None
+    time_to_limit_lower_bound_s = (
+        float(time_to_limit_s)
+        if time_to_limit_observed
+        else float(duration_s)
+    )
+
+    # Normalize each component against its own initial state and own limit.
+    initial_temps = table["Initial Temp (C)"].astype(float).to_numpy()
+    normalized_margins = {}
+    for name in names:
+        i = index[name]
+        denominator = max(
+            float(limits[i] - initial_temps[i]),
+            1e-6,
+        )
+        normalized_margins[name] = min(
+            1.0,
+            float(
+                (limits[i] - peak_temps[name])
+                / denominator
+            ),
+        )
+
+    normalized_headroom = (
+        min(normalized_margins.values())
+        if normalized_margins
+        else float("nan")
+    )
+
+    if time_to_limit_observed:
+        readiness = "HOLD"
+        recommendation = (
+            f"HOLD / COOL: {first_limit_component} reaches its modeled limit "
+            f"at ~{time_to_limit_s:.1f} s."
+        )
+    elif min_margin_c < 5.0:
+        readiness = "CAUTION"
+        recommendation = (
+            f"CAUTION: {limiting_component} has only "
+            f"{min_margin_c:.1f} °C peak margin."
+        )
+    else:
+        readiness = "READY"
+        recommendation = (
+            f"READY: minimum modeled component margin is "
+            f"{min_margin_c:.1f} °C at {limiting_component}."
+        )
+
+    summary = {
+        "readiness": readiness,
+        "recommendation": recommendation,
+        "limiting_component": limiting_component,
+        "minimum_peak_margin_c": float(min_margin_c),
+        "time_to_limit_s": float(time_to_limit_s),
+        "time_to_limit_observed": bool(time_to_limit_observed),
+        "time_to_limit_lower_bound_s": float(time_to_limit_lower_bound_s),
+        "simulation_horizon_s": float(duration_s),
+        "normalized_thermal_headroom": float(normalized_headroom),
+        "component_normalized_margins": normalized_margins,
+        "peak_temperatures_c": peak_temps,
+        "component_limits_c": {
+            name: float(limits[index[name]]) for name in names
+        },
+        "internal_heat_input_kw": float(internal_heat_kw),
+        "cooling_command": float(cooling_command),
+    }
+    return history, summary
+
+
+def simulate_fourier_1d_slab(
+    env: Environment,
+    duration_s: float,
+    requested_dt_s: float,
+    thickness_m: float,
+    node_count: int,
+    thermal_conductivity_w_mk: float,
+    density_kg_m3: float,
+    specific_heat_j_kgk: float,
+    incident_heat_flux_kw_m2: float,
+    absorptivity: float,
+    front_h_w_m2k: float,
+    back_h_w_m2k: float,
+    back_fluid_temp_c: float,
+    initial_temp_c: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    """
+    Explicit finite-volume solution of 1-D transient Fourier conduction:
+
+        rho cp dT/dt = d/dx(k dT/dx)
+
+    with absorbed front-surface heat flux and convective front/back boundaries.
+    The explicit timestep is constrained by both the interior Fourier-number
+    criterion and the front/back convective-boundary coefficients.
+    """
+    duration_s = max(float(duration_s), 0.1)
+    thickness_m = max(float(thickness_m), 1e-5)
+    node_count = max(int(node_count), 4)
+    k = max(float(thermal_conductivity_w_mk), 1e-6)
+    rho = max(float(density_kg_m3), 1e-6)
+    cp = max(float(specific_heat_j_kgk), 1e-6)
+    q_abs_w_m2 = max(float(incident_heat_flux_kw_m2), 0.0) * 1000.0 * clamp(absorptivity)
+    h_front = max(float(front_h_w_m2k), 0.0)
+    h_back = max(float(back_h_w_m2k), 0.0)
+
+    dx = thickness_m / node_count
+    alpha = k / (rho * cp)
+
+    # Explicit finite-volume stability limits.
+    # Interior cell: Fo = alpha*dt/dx^2 <= 0.45.
+    dt_interior = 0.45 * dx * dx / max(alpha, 1e-20)
+
+    # Boundary cells include conductive and convective removal terms.
+    # Lambda_boundary = dt * (alpha/dx^2 + h/(rho*cp*dx)) <= 0.45.
+    front_rate = (
+        alpha / (dx * dx)
+        + h_front / (rho * cp * dx)
+    )
+    back_rate = (
+        alpha / (dx * dx)
+        + h_back / (rho * cp * dx)
+    )
+    dt_front = 0.45 / max(front_rate, 1e-20)
+    dt_back = 0.45 / max(back_rate, 1e-20)
+
+    dt_requested = max(float(requested_dt_s), 1e-8)
+    dt_internal = min(
+        dt_requested,
+        dt_interior,
+        dt_front,
+        dt_back,
+    )
+    if not math.isfinite(dt_internal) or dt_internal <= 0.0:
+        raise ValueError("No positive stable timestep exists for the selected Fourier inputs.")
+
+    output_dt = max(float(requested_dt_s), dt_internal)
+
+    T = np.full(node_count, float(initial_temp_c), dtype=float)
+    cell_capacity_j_m2k = rho * cp * dx
+
+    output_times = np.arange(0.0, duration_s + 0.5 * output_dt, output_dt)
+    rows = []
+    snapshots = []
+    t = 0.0
+    next_out = 0
+
+    def store(time_s: float):
+        rows.append(
+            {
+                "Time (s)": float(time_s),
+                "Front Surface Temp (C)": float(T[0]),
+                "Midplane Temp (C)": float(T[node_count // 2]),
+                "Back Surface Temp (C)": float(T[-1]),
+            }
+        )
+        for i, temp in enumerate(T):
+            snapshots.append(
+                {
+                    "Time (s)": float(time_s),
+                    "Depth (mm)": float((i + 0.5) * dx * 1000.0),
+                    "Temperature (C)": float(temp),
+                }
+            )
+
+    store(0.0)
+    next_out = 1
+
+    while t < duration_s - 1e-12:
+        h = min(dt_internal, duration_s - t)
+        q = np.zeros(node_count, dtype=float)
+
+        for i in range(node_count - 1):
+            q_cond = k * (T[i] - T[i + 1]) / dx
+            q[i] -= q_cond
+            q[i + 1] += q_cond
+
+        q[0] += q_abs_w_m2 - h_front * (T[0] - float(env.ambient_temp_c))
+        q[-1] -= h_back * (T[-1] - float(back_fluid_temp_c))
+
+        T = T + h * q / cell_capacity_j_m2k
+        t += h
+
+        while next_out < len(output_times) and t >= output_times[next_out] - 1e-10:
+            store(output_times[next_out])
+            next_out += 1
+
+    history = pd.DataFrame(rows)
+    profile = pd.DataFrame(snapshots)
+
+    fourier_number = float(alpha * dt_internal / (dx * dx))
+    front_boundary_number = float(front_rate * dt_internal)
+    back_boundary_number = float(back_rate * dt_internal)
+
+    summary = {
+        "alpha_m2_s": float(alpha),
+        "dx_m": float(dx),
+        "internal_dt_s": float(dt_internal),
+        "fourier_number": fourier_number,
+        "front_boundary_number": front_boundary_number,
+        "back_boundary_number": back_boundary_number,
+        "max_explicit_stability_number": float(
+            max(
+                fourier_number,
+                front_boundary_number,
+                back_boundary_number,
+            )
+        ),
+        "front_peak_c": float(history["Front Surface Temp (C)"].max()),
+        "back_peak_c": float(history["Back Surface Temp (C)"].max()),
+        "absorbed_heat_flux_kw_m2": float(q_abs_w_m2 / 1000.0),
+    }
+    return history, profile, summary
+
+
+def periodic_thermal_frequency_diagnostic(
+    duration_s: float,
+    sample_dt_s: float,
+    active_heat_kw: float,
+    duty_cycle: float,
+    period_s: float,
+) -> pd.DataFrame:
+    """FFT diagnostic for a user-defined periodic thermal load."""
+    duration_s = max(float(duration_s), 1.0)
+    sample_dt_s = max(float(sample_dt_s), 1e-3)
+    period_s = max(float(period_s), sample_dt_s * 2.0)
+    duty_cycle = clamp(float(duty_cycle), 0.01, 1.0)
+    active_heat_kw = max(float(active_heat_kw), 0.0)
+
+    t = np.arange(0.0, duration_s, sample_dt_s)
+    phase = np.mod(t, period_s) / period_s
+    load = np.where(phase < duty_cycle, active_heat_kw, 0.0)
+
+    centered = load - float(np.mean(load))
+    spectrum = np.fft.rfft(centered)
+    freq = np.fft.rfftfreq(len(centered), d=sample_dt_s)
+    amplitude = np.abs(spectrum) * 2.0 / max(len(centered), 1)
+
+    df = pd.DataFrame(
+        {
+            "Frequency (Hz)": freq,
+            "Amplitude (kW)": amplitude,
+        }
+    )
+    return df[df["Frequency (Hz)"] > 0.0].reset_index(drop=True)
+
+
+def thermal_power_requirement_table(
+    thermal_summary: dict,
+    min_component_margin_c: float,
+    min_thermal_headroom: float,
+    minimum_time_to_limit_s: float,
+) -> pd.DataFrame:
+    """
+    Lifecycle-style requirements compliance/traceability view for the optional
+    component thermal digital twin.
+
+    A time-to-limit requirement is PASS only when:
+      1) the threshold crossing is observed at or after the requirement, or
+      2) no crossing is observed and the simulated horizon itself reaches or
+         exceeds the verification threshold.
+
+    Otherwise the result is INDETERMINATE rather than falsely treating a
+    right-censored simulation as infinite time-to-limit.
+    """
+    observed = bool(thermal_summary.get("time_to_limit_observed", False))
+    ttl = float(thermal_summary.get("time_to_limit_s", float("nan")))
+    horizon = float(thermal_summary.get("simulation_horizon_s", 0.0))
+    ttl_lower_bound = float(
+        thermal_summary.get("time_to_limit_lower_bound_s", horizon)
+    )
+
+    base_rows = [
+        {
+            "Need ID": "NEED-THM-001",
+            "Parent Requirement": "SYS-THM-001",
+            "Requirement": "REQ-THM-002",
+            "Requirement Statement": (
+                "The modeled thermal architecture shall maintain at least the "
+                "specified minimum component peak-temperature margin."
+            ),
+            "Source / Rationale": "Protect modeled component thermal limits.",
+            "Allocated Function": "Reject and distribute waste heat",
+            "Allocated Model / Subsystem": "Component thermal-state network",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current thermal-network scenario",
+            "Evidence": "Minimum component peak-temperature margin",
+            "Metric": "Minimum component peak-temperature margin (°C)",
+            "Value": float(
+                thermal_summary.get("minimum_peak_margin_c", float("nan"))
+            ),
+            "Operator": ">=",
+            "Threshold": float(min_component_margin_c),
+        },
+        {
+            "Need ID": "NEED-THM-001",
+            "Parent Requirement": "SYS-THM-001",
+            "Requirement": "REQ-THM-003",
+            "Requirement Statement": (
+                "The modeled thermal architecture shall retain the specified "
+                "minimum normalized component-specific thermal headroom."
+            ),
+            "Source / Rationale": "Preserve margin to each component's own limit.",
+            "Allocated Function": "Maintain thermal headroom",
+            "Allocated Model / Subsystem": "Component thermal-state network",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current thermal-network scenario",
+            "Evidence": "Minimum normalized component-specific thermal margin",
+            "Metric": "Normalized component thermal headroom",
+            "Value": float(
+                thermal_summary.get("normalized_thermal_headroom", float("nan"))
+            ),
+            "Operator": ">=",
+            "Threshold": float(min_thermal_headroom),
+        },
+    ]
+
+    rows = []
+    for row in base_rows:
+        value = float(row["Value"])
+        threshold = float(row["Threshold"])
+        row["Status"] = (
+            "PASS"
+            if math.isfinite(value) and value >= threshold
+            else "FAIL"
+        )
+        rows.append(row)
+
+    if observed:
+        ttl_status = (
+            "PASS"
+            if math.isfinite(ttl) and ttl >= float(minimum_time_to_limit_s)
+            else "FAIL"
+        )
+        ttl_evidence = f"Observed first limit crossing at {ttl:.3f} s"
+        ttl_value = ttl
+    elif horizon >= float(minimum_time_to_limit_s):
+        ttl_status = "PASS"
+        ttl_evidence = (
+            f"No limit crossing through {horizon:.3f} s; requirement threshold "
+            "is fully covered by the simulated horizon."
+        )
+        ttl_value = ttl_lower_bound
+    else:
+        ttl_status = "INDETERMINATE"
+        ttl_evidence = (
+            f"No limit crossing through {horizon:.3f} s, but the simulation "
+            f"horizon does not reach the {float(minimum_time_to_limit_s):.3f} s "
+            "verification threshold."
+        )
+        ttl_value = ttl_lower_bound
+
+    rows.append(
+        {
+            "Need ID": "NEED-OPS-001",
+            "Parent Requirement": "SYS-CTL-001",
+            "Requirement": "REQ-CTL-001",
+            "Requirement Statement": (
+                "The modeled thermal architecture shall avoid the first component "
+                "temperature limit for at least the specified duration."
+            ),
+            "Source / Rationale": "Support required operating duration before cooldown.",
+            "Allocated Function": "Predict thermal operating window",
+            "Allocated Model / Subsystem": "Component thermal-state network",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current thermal-network scenario",
+            "Evidence": ttl_evidence,
+            "Metric": "Time to first component thermal limit (s)",
+            "Value": float(ttl_value),
+            "Operator": ">=",
+            "Threshold": float(minimum_time_to_limit_s),
+            "Status": ttl_status,
+        }
+    )
+
+    return pd.DataFrame(rows)
+
 # ============================================================
 # Coupled engagement model
 # ============================================================
@@ -4954,8 +5533,10 @@ def generic_six_dof_rigid_body(
     User force/moment inputs are generic engineering excitations, not a
     validated aerodynamic or propulsion model for any specific vehicle.
 
-    Body axes use x-forward, y-right, z-up to remain consistent with the
-    app's z-up visualization convention.
+    Body axes use a right-handed FLU convention: x-forward, y-left, z-up.
+    The inertial/visualization frame remains right-handed and z-up. NASA GTM
+    reference data are normally FRD/NED (x-forward, y-right, z-down) and are
+    explicitly transformed into this FLU/z-up convention before benchmarking.
 
     This model is isolated from directed-energy effect calculations.
     """
@@ -6241,63 +6822,125 @@ def requirement_evaluation_table(
     min_detection_probability: float,
 ):
     """
-    Generic requirements traceability table using existing model outputs.
+    Lightweight lifecycle requirements traceability and compliance matrix.
+
+    Each requirement is linked to a parent need/requirement, allocated function
+    and model element, verification method/case, quantitative evidence, and
+    compliance status. This remains a compact digital-engineering traceability
+    implementation, not a replacement for a controlled enterprise RM database.
     """
     requirements = [
-        (
-            "REQ-TRK-001",
-            "Track quality",
-            result.get("Track Quality", float("nan")),
-            ">=",
-            min_track_quality,
-        ),
-        (
-            "REQ-PNT-001",
-            "Effective pointing error (mrad)",
-            result.get("Effective Pointing Error (mrad)", float("nan")),
-            "<=",
-            max_pointing_error_mrad,
-        ),
-        (
-            "REQ-THM-001",
-            "Thermal margin",
-            result.get("Thermal Margin", float("nan")),
-            ">=",
-            min_thermal_margin,
-        ),
-        (
-            "REQ-ENG-001",
-            "Energy margin",
-            result.get("Energy Margin", float("nan")),
-            ">=",
-            min_energy_margin,
-        ),
-        (
-            "REQ-SNS-001",
-            "Detection probability",
-            result.get("Detection Probability", float("nan")),
-            ">=",
-            min_detection_probability,
-        ),
+        {
+            "Need ID": "NEED-TRK-001",
+            "Parent Requirement": "SYS-TRK-001",
+            "Requirement": "REQ-TRK-001",
+            "Requirement Statement": (
+                "The system shall maintain track quality at or above the "
+                "specified threshold for the evaluated scenario."
+            ),
+            "Source / Rationale": "Support stable pointing and engagement decisions.",
+            "Allocated Function": "Estimate target state",
+            "Allocated Model / Subsystem": "State estimation / EKF",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current engagement simulation",
+            "Evidence": "Track Quality",
+            "Metric": "Track quality",
+            "Value": result.get("Track Quality", float("nan")),
+            "Operator": ">=",
+            "Threshold": min_track_quality,
+        },
+        {
+            "Need ID": "NEED-PNT-001",
+            "Parent Requirement": "SYS-PNT-001",
+            "Requirement": "REQ-PNT-001",
+            "Requirement Statement": (
+                "The modeled pointing solution shall keep effective pointing "
+                "error at or below the specified limit."
+            ),
+            "Source / Rationale": "Preserve aimpoint/beam-placement margin.",
+            "Allocated Function": "Point and stabilize beam director",
+            "Allocated Model / Subsystem": "Pointing / beam geometry",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current engagement simulation",
+            "Evidence": "Effective Pointing Error (mrad)",
+            "Metric": "Effective pointing error (mrad)",
+            "Value": result.get("Effective Pointing Error (mrad)", float("nan")),
+            "Operator": "<=",
+            "Threshold": max_pointing_error_mrad,
+        },
+        {
+            "Need ID": "NEED-THM-001",
+            "Parent Requirement": "SYS-THM-001",
+            "Requirement": "REQ-THM-001",
+            "Requirement Statement": (
+                "The platform shall retain at least the specified primary-model "
+                "thermal margin in the evaluated scenario."
+            ),
+            "Source / Rationale": "Prevent modeled thermal-limit exceedance.",
+            "Allocated Function": "Reject waste heat",
+            "Allocated Model / Subsystem": "Platform power/thermal",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current engagement simulation",
+            "Evidence": "Thermal Margin",
+            "Metric": "Thermal margin",
+            "Value": result.get("Thermal Margin", float("nan")),
+            "Operator": ">=",
+            "Threshold": min_thermal_margin,
+        },
+        {
+            "Need ID": "NEED-PWR-001",
+            "Parent Requirement": "SYS-PWR-001",
+            "Requirement": "REQ-ENG-001",
+            "Requirement Statement": (
+                "The platform shall retain at least the specified stored-energy "
+                "margin in the evaluated scenario."
+            ),
+            "Source / Rationale": "Maintain resource availability through the engagement.",
+            "Allocated Function": "Supply and manage electrical energy",
+            "Allocated Model / Subsystem": "Platform power/energy",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current engagement simulation",
+            "Evidence": "Energy Margin",
+            "Metric": "Energy margin",
+            "Value": result.get("Energy Margin", float("nan")),
+            "Operator": ">=",
+            "Threshold": min_energy_margin,
+        },
+        {
+            "Need ID": "NEED-SNS-001",
+            "Parent Requirement": "SYS-SNS-001",
+            "Requirement": "REQ-SNS-001",
+            "Requirement Statement": (
+                "The modeled sensing architecture shall achieve at least the "
+                "specified detection probability for the evaluated scenario."
+            ),
+            "Source / Rationale": "Support initiation of the engagement loop.",
+            "Allocated Function": "Detect target",
+            "Allocated Model / Subsystem": "Sensor/detection model",
+            "Verification Method": "Analysis",
+            "Verification Case": "Current engagement simulation",
+            "Evidence": "Detection Probability",
+            "Metric": "Detection probability",
+            "Value": result.get("Detection Probability", float("nan")),
+            "Operator": ">=",
+            "Threshold": min_detection_probability,
+        },
     ]
 
     rows = []
-    for req_id, name, value, op, threshold in requirements:
-        if op == ">=":
-            passed = bool(value >= threshold)
+    for row in requirements:
+        value = float(row["Value"])
+        threshold = float(row["Threshold"])
+        if not math.isfinite(value):
+            status = "INDETERMINATE"
+        elif row["Operator"] == ">=":
+            status = "PASS" if value >= threshold else "FAIL"
         else:
-            passed = bool(value <= threshold)
+            status = "PASS" if value <= threshold else "FAIL"
 
-        rows.append(
-            {
-                "Requirement": req_id,
-                "Metric": name,
-                "Value": value,
-                "Operator": op,
-                "Threshold": threshold,
-                "Status": "PASS" if passed else "FAIL",
-            }
-        )
+        row_out = dict(row)
+        row_out["Status"] = status
+        rows.append(row_out)
 
     return pd.DataFrame(rows)
 
@@ -6374,8 +7017,11 @@ def model_provenance_table():
             {
                 "Subsystem": "Atmosphere",
                 "Model type": "Phenomenological / Beer-Lambert",
-                "Validation status": "Atmospheric state can be checked against NOAA IGRA; optical propagation is not validated against MODTRAN or beam-test data",
-                "Intended use": "Sensitivity and systems trade studies",
+                "Validation status": (
+                    "Atmospheric-state variables support NOAA IGRA observational "
+                    "comparison; optical transmission is not empirically validated"
+                ),
+                "Intended use": "Sensitivity, observational comparison, and systems trade studies",
             },
             {
                 "Subsystem": "Platform power/thermal",
@@ -6384,9 +7030,30 @@ def model_provenance_table():
                 "Intended use": "Resource-coupling demonstration",
             },
             {
+                "Subsystem": "Generic 6-DOF dynamics",
+                "Model type": "Generic rigid-body dynamics with quadratic drag",
+                "Validation status": (
+                    "NASA GTM model-to-model reference benchmarking available; "
+                    "not empirical flight-test validation"
+                ),
+                "Intended use": "Generic aerospace dynamics and reference benchmarking",
+            },
+            {
+                "Subsystem": "Component thermal network",
+                "Model type": "Generic multi-node lumped thermal network",
+                "Validation status": "Numerical/requirements checks only",
+                "Intended use": "Thermal architecture, margin, and cooldown trade studies",
+            },
+            {
+                "Subsystem": "1-D Fourier conduction",
+                "Model type": "Explicit finite-volume transient conduction",
+                "Validation status": "Numerical stability check; user-specified material properties",
+                "Intended use": "Higher-fidelity thermal sensitivity and verification studies",
+            },
+            {
                 "Subsystem": "Target thermal response",
                 "Model type": "Generic lumped areal thermal index",
-                "Validation status": "Engineering thermal/effect indicator; not empirically validated for lethality or component damage",
+                "Validation status": "Not a lethality/damage model",
                 "Intended use": "Non-operational engineering indicator",
             },
         ]
@@ -6809,6 +7476,7 @@ def canonicalize_nasa_gtm_csv(
     force_units: str = "N",
     moment_units: str = "N·m",
     altitude_units: str = "m",
+    body_frame_convention: str = "NASA/GTM FRD",
 ):
     """
     Convert an uploaded NASA GTM simulation export to the app's canonical
@@ -6817,6 +7485,25 @@ def canonicalize_nasa_gtm_csv(
     GTM's open example scripts commonly report body velocities in ft/s and
     angular rates in rad/s internally, while plots may display deg/s.
     The user explicitly chooses the export units used by their CSV.
+
+    Canonical app frame:
+      body: x-forward, y-left, z-up (FLU, right-handed)
+      inertial/visualization: z-up
+
+    NASA/GTM reference exports are normally interpreted as:
+      body: x-forward, y-right, z-down (FRD, right-handed)
+      navigation reference: NED-style orientation convention
+
+    When body_frame_convention == "NASA/GTM FRD", vectors and Euler states are
+    transformed with S = diag(1, -1, -1), equivalent to a 180-degree basis
+    rotation about x. This gives:
+      [u, v, w]_FLU = [u, -v, -w]_FRD
+      [p, q, r]_FLU = [p, -q, -r]_FRD
+      [Fx, Fy, Fz]_FLU = [Fx, -Fy, -Fz]_FRD
+      [L, M, N]_FLU = [L, -M, -N]_FRD
+      [roll, pitch, yaw]_FLU = [roll, -pitch, -yaw]_FRD
+
+    Altitude remains a positive-up scalar.
     """
     df = pd.read_csv(
         uploaded_file
@@ -7029,6 +7716,28 @@ def canonicalize_nasa_gtm_csv(
             if col in out.columns:
                 out[col] *= 1.3558179483314
 
+    if body_frame_convention == "NASA/GTM FRD":
+        # FRD/NED -> app FLU/z-up basis transform, S = diag(1, -1, -1).
+        for col in [
+            "V body (m/s)",
+            "W body (m/s)",
+            "q body rate (deg/s)",
+            "r body rate (deg/s)",
+            "Pitch (deg)",
+            "Yaw (deg)",
+            "Fy body (N)",
+            "Fz body (N)",
+            "M body moment (N·m)",
+            "N body moment (N·m)",
+        ]:
+            if col in out.columns:
+                out[col] *= -1.0
+    elif body_frame_convention != "App FLU":
+        raise ValueError(
+            "body_frame_convention must be 'NASA/GTM FRD' or 'App FLU'."
+        )
+
+    out["Canonical Body Frame"] = "FLU: x-forward, y-left, z-up"
     return out
 
 
@@ -7100,7 +7809,7 @@ def simulate_matched_six_dof_gtm_case(
     Run the generic 6-DOF rigid-body model on the exact NASA GTM reference
     timestamps, initialized from the first valid GTM state.
 
-    This is the app's matched validation mode. It does not claim vehicle
+    This is the app's matched reference-benchmark mode. It does not claim vehicle
     equivalence unless the user supplies GTM-consistent mass/inertia and
     equivalent force/moment excitations.
     """
@@ -7148,7 +7857,7 @@ def simulate_matched_six_dof_gtm_case(
 
     if len(ref) < 2:
         raise ValueError(
-            "Matched GTM validation requires at least two valid reference samples."
+            "Matched GTM reference benchmarking requires at least two valid reference samples."
         )
 
     times = ref[
@@ -8101,9 +8810,9 @@ def validation_provenance_table():
             {
                 "Reference": "NASA Generic Transport Model (GTM_DesignSim)",
                 "Provider": "NASA Langley Research Center",
-                "Role": "6-DOF flight-dynamics reference comparison",
+                "Role": "6-DOF flight-dynamics reference-model benchmarking",
                 "Source": NASA_GTM_REPO_URL,
-                "Evidence type": "Independent nonlinear reference simulation",
+                "Evidence type": "Independent nonlinear reference-model benchmark",
             },
             {
                 "Reference": "NASA Software Catalog LAR-17625-1",
@@ -8171,8 +8880,7 @@ st.caption(
     "Low-order, non-classified digital engineering prototype. "
     "The model now includes Kalman covariance propagation, Beer-Lambert atmospheric "
     "extinction, and a lumped target thermal-response model. Outputs remain generic "
-    "engineering simulation estimates. NASA GTM and NOAA comparisons validate only the specific states, atmospheric "
-    "variables, cases, and regimes actually evaluated; they do not establish general weapon-performance validity."
+    "engineering estimates, not validated weapon-performance predictions."
 )
 
 
@@ -8362,10 +9070,9 @@ with st.sidebar:
         key="target_speed_v4",
         step=5.0,
         help=(
-            "Category-aware generic simulation envelope. Target-speed applicability "
-            "depends on the active model configuration and demonstrated validation regime. "
-            "The Advanced Twin supports higher-fidelity 3-DOF/6-DOF aerospace kinematics; "
-            "results outside validated cases remain engineering simulation outputs."
+            "Category-aware generic simulation envelope. The directed-energy effect "
+            "model remains intentionally limited to 350 m/s; higher-speed aerospace "
+            "cases are handled in the isolated Advanced Twin."
         ),
     )
     velocity_angle_deg = st.slider(
@@ -8827,7 +9534,7 @@ else:
     st.error(result["Recommendation"])
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs(
     [
         "Engagement Loop",
         "State Estimation",
@@ -8838,7 +9545,8 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
         "Export",
         "Advanced Twin / V&V",
         "Engineering Lab",
-        "Empirical Validation",
+        "Validation & Reference Benchmarking",
+        "Thermal & Power Digital Twin",
     ]
 )
 
@@ -9410,7 +10118,7 @@ with tab6:
         st.caption(
             "These values describe the modeled target state at the currently selected "
             "3-D timestep. The Thermal Effect Index is a normalized engineering metric, "
-            "an engineering thermal-effect indicator, not a validated probability-of-kill or component-damage prediction."
+            "not a probability of kill or validated damage prediction."
         )
 
         engagement_readout = pd.DataFrame(
@@ -10716,7 +11424,7 @@ with tab8:
 with tab9:
     st.markdown("### Engineering Lab")
     st.caption(
-        "Measurement-driven tracking, requirements traceability, trade studies, "
+        "Measurement-driven tracking, lifecycle requirements traceability/compliance, trade studies, "
         "model provenance, and regression checks. These tools are for generic "
         "systems-engineering analysis and remain isolated from operational effect modeling."
     )
@@ -11050,17 +11758,17 @@ with tab9:
 
 
 # ============================================================
-# Empirical Validation Lab
+# Validation & Reference Benchmarking
 # ============================================================
 
 with tab10:
-    st.markdown("### Empirical Validation Lab")
+    st.markdown("### Validation & Reference Benchmarking")
     st.caption(
-        "Compare the generic aerospace models against independent public reference "
-        "data. NASA GTM comparison requires a CSV exported from GTM_DesignSim or a "
-        "derived GTM reference run. NOAA IGRA observations can be retrieved directly "
-        "from NCEI by station ID. Validation applies only to the variables, regimes, "
-        "and cases actually compared."
+        "Compare generic aerospace models against independent public reference evidence. "
+        "NASA GTM is treated as model-to-model reference benchmarking, not empirical "
+        "flight-test validation. NOAA IGRA provides observational atmospheric validation "
+        "for the measured state variables actually compared. Conclusions apply only to "
+        "the variables, regimes, and cases represented by the evidence."
     )
 
     st.markdown("#### Validation Provenance")
@@ -11075,13 +11783,13 @@ with tab10:
         },
     )
 
-    st.markdown("#### NASA Generic Transport Model Comparison")
+    st.markdown("#### NASA GTM Reference Benchmark")
     st.caption(
         "NASA's GTM_DesignSim is an independent nonlinear transport-aircraft flight-"
-        "dynamics simulation. To avoid falsely claiming validation, this app does not "
-        "ship synthetic GTM results as empirical evidence. Upload a CSV exported from "
-        "an actual GTM run. The comparison interpolates the current generic 6-DOF truth "
-        "onto the NASA reference timestamps and reports formal residual statistics."
+        "dynamics simulation. It is used here as reference-model benchmarking evidence, "
+        "not as empirical flight-test data. Upload a CSV exported from an actual GTM run. "
+        "The app transforms the selected GTM frame convention into its canonical FLU/z-up "
+        "frame, aligns timestamps, and reports formal residual statistics."
     )
 
     gtm_source_c1, gtm_source_c2 = st.columns(2)
@@ -11128,6 +11836,27 @@ with tab10:
             key="gtm_attitude_units",
         )
 
+    gtm_frame_c1, gtm_frame_c2 = st.columns(2)
+    with gtm_frame_c1:
+        gtm_body_frame = st.selectbox(
+            "GTM body-axis convention",
+            [
+                "NASA/GTM FRD",
+                "App FLU",
+            ],
+            key="gtm_body_frame",
+            help=(
+                "NASA/GTM FRD means x-forward, y-right, z-down. The app "
+                "transforms FRD/NED states into its right-handed FLU/z-up "
+                "canonical frame before reference benchmarking."
+            ),
+        )
+    with gtm_frame_c2:
+        st.info(
+            "Canonical app frame: x-forward, y-left, z-up. "
+            "Altitude remains positive-up."
+        )
+
     gtm_extra1, gtm_extra2, gtm_extra3 = st.columns(3)
     with gtm_extra1:
         gtm_force_units = st.selectbox(
@@ -11149,15 +11878,15 @@ with tab10:
         )
 
     gtm_validation_mode = st.radio(
-        "NASA GTM validation mode",
+        "NASA GTM benchmark mode",
         [
-            "Matched validation",
+            "Matched reference benchmark",
             "Comparative overlay only",
         ],
         horizontal=True,
         key="gtm_validation_mode",
         help=(
-            "Matched validation initializes the generic 6-DOF model from the "
+            "Matched reference benchmarking initializes the generic 6-DOF model from the "
             "first NASA GTM state, uses the exact GTM timestamp grid, and requires "
             "GTM-consistent mass/inertia and equivalent excitation assumptions."
         ),
@@ -11173,9 +11902,10 @@ with tab10:
                 force_units=gtm_force_units,
                 moment_units=gtm_moment_units,
                 altitude_units=gtm_altitude_units,
+                body_frame_convention=gtm_body_frame,
             )
 
-            if gtm_validation_mode == "Matched validation":
+            if gtm_validation_mode == "Matched reference benchmark":
                 st.markdown("##### Matched GTM Case Definition")
 
                 mg1, mg2, mg3, mg4 = st.columns(4)
@@ -11437,7 +12167,7 @@ with tab10:
 
             st.markdown(
                 "##### NASA GTM Matched Validation Residuals"
-                if gtm_validation_mode == "Matched validation"
+                if gtm_validation_mode == "Matched reference benchmark"
                 else "##### NASA GTM Comparative Residual / Error Report"
             )
             if gtm_report.empty:
@@ -11557,7 +12287,7 @@ with tab10:
                             ),
                             (
                                 "Matched 6-DOF Model"
-                                if gtm_validation_mode == "Matched validation"
+                                if gtm_validation_mode == "Matched reference benchmark"
                                 else "Current 6-DOF Model"
                             ): model_interp,
                         }
@@ -11882,26 +12612,26 @@ with tab10:
             "of uncertainty."
         )
 
-    st.markdown("#### Formal Validation Record")
+    st.markdown("#### Validation & Benchmark Evidence Record")
     validation_record = {
         "generated_utc": datetime.utcnow().isoformat() + "Z",
         "application_model": "Directed Energy Engagement Digital Twin",
-        "validation_scope": {
+        "evidence_scope": {
             "NASA_GTM": (
-                "Matched or comparative 6-DOF state comparison from user-supplied independent GTM run"
+                "Matched or comparative 6-DOF reference-model benchmark from a user-supplied independent GTM run"
             ),
             "NOAA_IGRA": (
-                "Observed atmospheric-profile comparison"
+                "Observational atmospheric-profile validation against NOAA IGRA"
             ),
         },
         "sources": validation_provenance_table().to_dict(
             orient="records"
         ),
         "limitations": [
-            "Validation applies only to the specific compared regimes, variables, and reference cases.",
-            "NASA GTM comparison does not imply the generic vehicle equals the GTM aircraft.",
+            "Evidence applies only to the compared regimes, variables, and reference cases.",
+            "NASA GTM benchmarking does not imply empirical validation or vehicle equivalence.",
             "NOAA radiosonde comparison does not validate directed-energy optical effects.",
-            "Thermal/effect outputs are engineering indicators; no empirical lethality or probability-of-kill validation is claimed.",
+            "No lethality or probability-of-kill validation is claimed.",
         ],
     }
 
@@ -11942,12 +12672,359 @@ with tab10:
     )
 
     st.download_button(
-        "Download Formal Validation Record JSON",
+        "Download Validation & Benchmark Record JSON",
         validation_json,
-        file_name="empirical_validation_record.json",
+        file_name="validation_benchmark_record.json",
         mime="application/json",
         width="stretch",
     )
+
+
+# ============================================================
+# Thermal & Power Digital Twin
+# ============================================================
+
+with tab11:
+    st.markdown("### Thermal & Power Digital Twin")
+    st.caption(
+        "Optional higher-fidelity thermal-management and decision-support tools. "
+        "The primary engagement model remains unchanged. Component-network and 1-D "
+        "Fourier calculations are isolated engineering analyses using user-visible "
+        "assumptions and are not validated hardware-performance predictions."
+    )
+
+    st.markdown("#### Component Thermal-State Network")
+    tp_c1, tp_c2, tp_c3, tp_c4 = st.columns(4)
+    with tp_c1:
+        tp_duration_s = st.slider("Thermal simulation duration (s)", 5.0, 600.0, 120.0, 5.0, key="tp_duration_s")
+    with tp_c2:
+        tp_dt_s = st.slider("Output timestep (s)", 0.05, 2.0, 0.25, 0.05, key="tp_dt_s")
+    with tp_c3:
+        tp_load_scale = st.slider("Thermal load multiplier", 0.0, 2.0, 1.0, 0.05, key="tp_load_scale")
+    with tp_c4:
+        tp_cooling_command = st.slider("Cooling command", 0.0, 1.0, 1.0, 0.05, key="tp_cooling_command")
+
+    component_table = st.data_editor(
+        default_component_thermal_table(platform, env),
+        width="stretch",
+        hide_index=True,
+        num_rows="fixed",
+        key="tp_component_table",
+    )
+
+    thermal_history, thermal_summary = simulate_component_thermal_network(
+        platform, env, result, component_table,
+        tp_duration_s, tp_dt_s, tp_load_scale, tp_cooling_command,
+    )
+
+    thm1, thm2, thm3, thm4 = st.columns(4)
+    thm1.metric("Thermal Readiness", thermal_summary["readiness"])
+    thm2.metric("Limiting Component", thermal_summary["limiting_component"])
+    thm3.metric("Minimum Peak Margin", f"{thermal_summary['minimum_peak_margin_c']:.1f} °C")
+    ttl_value = thermal_summary["time_to_limit_s"]
+    ttl_observed = bool(thermal_summary.get("time_to_limit_observed", False))
+    ttl_horizon = float(thermal_summary.get("simulation_horizon_s", tp_duration_s))
+    thm4.metric(
+        "Time to Thermal Limit",
+        (
+            f"{ttl_value:.1f} s"
+            if ttl_observed and math.isfinite(ttl_value)
+            else f"> {ttl_horizon:.1f} s (censored)"
+        ),
+    )
+
+    if thermal_summary["readiness"] == "READY":
+        st.success(thermal_summary["recommendation"])
+    elif thermal_summary["readiness"] == "CAUTION":
+        st.warning(thermal_summary["recommendation"])
+    else:
+        st.error(thermal_summary["recommendation"])
+
+    component_temp_fig = go.Figure()
+    for component_name in component_table["Component"].astype(str):
+        col = f"{component_name} Temp (C)"
+        if col in thermal_history.columns:
+            component_temp_fig.add_trace(
+                go.Scatter(
+                    x=thermal_history["Time (s)"],
+                    y=thermal_history[col],
+                    mode="lines",
+                    name=component_name,
+                )
+            )
+    component_temp_fig.update_layout(
+        height=520,
+        title="Component Thermal-State History",
+        xaxis_title="Time (s)",
+        yaxis_title="Temperature (°C)",
+        margin=dict(l=50, r=20, t=55, b=45),
+    )
+    st.plotly_chart(component_temp_fig, width="stretch", config={"responsive": True, "displaylogo": False})
+
+    st.markdown("##### Thermal Readiness Requirements")
+    tr1, tr2, tr3 = st.columns(3)
+    with tr1:
+        tp_req_margin_c = st.slider("REQ-THM-002 min component margin (°C)", 0.0, 30.0, 5.0, 0.5, key="tp_req_margin_c")
+    with tr2:
+        tp_req_headroom = st.slider("REQ-THM-003 min normalized headroom", 0.0, 1.0, 0.20, 0.05, key="tp_req_headroom")
+    with tr3:
+        tp_req_ttl = st.slider("REQ-CTL-001 min time to thermal limit (s)", 0.0, 600.0, 60.0, 5.0, key="tp_req_ttl")
+
+    thermal_req_df = thermal_power_requirement_table(
+        thermal_summary, tp_req_margin_c, tp_req_headroom, tp_req_ttl
+    )
+    st.dataframe(thermal_req_df, width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown("#### 1-D Fourier Heat-Conduction Model")
+    st.caption(
+        "Generic finite-volume transient conduction through a representative layer. "
+        "This higher-fidelity study is isolated from the primary target-effect model."
+    )
+
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        fourier_thickness_mm = st.slider("Layer thickness (mm)", 0.5, 50.0, 6.0, 0.5, key="fourier_thickness_mm")
+        fourier_nodes = st.slider("Spatial nodes", 6, 80, 24, 2, key="fourier_nodes")
+    with f2:
+        fourier_k = st.number_input("Thermal conductivity k (W/m·K)", 0.05, 500.0, 15.0, 0.5, key="fourier_k")
+        fourier_rho = st.number_input("Density ρ (kg/m³)", 10.0, 25000.0, 7800.0, 100.0, key="fourier_rho")
+    with f3:
+        fourier_cp = st.number_input("Specific heat cp (J/kg·K)", 50.0, 5000.0, 500.0, 10.0, key="fourier_cp")
+        fourier_abs = st.slider("Surface absorptivity", 0.0, 1.0, float(clamp(tgt.absorptivity)), 0.05, key="fourier_abs")
+    with f4:
+        fourier_front_h = st.number_input("Front convection h (W/m²·K)", 0.0, 5000.0, 25.0, 5.0, key="fourier_front_h")
+        fourier_back_h = st.number_input("Back-side cooling h (W/m²·K)", 0.0, 20000.0, 800.0, 50.0, key="fourier_back_h")
+
+    ff1, ff2, ff3, ff4 = st.columns(4)
+    with ff1:
+        default_fourier_duration = min(max(float(result.get("Effective Dwell Time (s)", 4.0)), 0.5), 120.0)
+        fourier_duration_s = st.slider("Fourier simulation duration (s)", 0.5, 120.0, default_fourier_duration, 0.5, key="fourier_duration_s")
+    with ff2:
+        fourier_output_dt_s = st.slider("Fourier output timestep (s)", 0.005, 1.0, 0.05, 0.005, key="fourier_output_dt_s")
+    with ff3:
+        fourier_flux = st.number_input(
+            "Incident heat flux (kW/m²)",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=float(max(result.get("Average Irradiance (kW/m^2)", 0.0), 0.0)),
+            step=1.0,
+            key="fourier_flux",
+        )
+    with ff4:
+        fourier_back_temp = st.number_input(
+            "Back-fluid temperature (°C)",
+            min_value=-100.0,
+            max_value=500.0,
+            value=float(platform.coolant_temp_c),
+            step=1.0,
+            key="fourier_back_temp",
+        )
+
+    fourier_history, fourier_profile, fourier_summary = simulate_fourier_1d_slab(
+        env=env,
+        duration_s=fourier_duration_s,
+        requested_dt_s=fourier_output_dt_s,
+        thickness_m=fourier_thickness_mm / 1000.0,
+        node_count=fourier_nodes,
+        thermal_conductivity_w_mk=fourier_k,
+        density_kg_m3=fourier_rho,
+        specific_heat_j_kgk=fourier_cp,
+        incident_heat_flux_kw_m2=fourier_flux,
+        absorptivity=fourier_abs,
+        front_h_w_m2k=fourier_front_h,
+        back_h_w_m2k=fourier_back_h,
+        back_fluid_temp_c=fourier_back_temp,
+        initial_temp_c=float(env.ambient_temp_c),
+    )
+
+    fm1, fm2, fm3, fm4 = st.columns(4)
+    fm1.metric("Peak Front Surface", f"{fourier_summary['front_peak_c']:.1f} °C")
+    fm2.metric("Peak Back Surface", f"{fourier_summary['back_peak_c']:.1f} °C")
+    fm3.metric("Interior Fo", f"{fourier_summary['fourier_number']:.3f}")
+    fm4.metric(
+        "Max Explicit Stability Number",
+        f"{fourier_summary['max_explicit_stability_number']:.3f}",
+    )
+
+    fstab1, fstab2, fstab3 = st.columns(3)
+    fstab1.metric(
+        "Front Boundary Number",
+        f"{fourier_summary['front_boundary_number']:.3f}",
+    )
+    fstab2.metric(
+        "Back Boundary Number",
+        f"{fourier_summary['back_boundary_number']:.3f}",
+    )
+    fstab3.metric(
+        "Internal Δt",
+        f"{fourier_summary['internal_dt_s']:.6g} s",
+    )
+
+    if fourier_summary["max_explicit_stability_number"] <= 0.45 + 1e-12:
+        st.success(
+            "Explicit 1-D conduction integration satisfies the interior and "
+            "convective-boundary stability criteria."
+        )
+    else:
+        st.error(
+            "Explicit stability criterion exceeded. Reduce timestep, reduce "
+            "boundary h, or increase spatial cell size."
+        )
+
+    fourier_fig = go.Figure()
+    for col in ["Front Surface Temp (C)", "Midplane Temp (C)", "Back Surface Temp (C)"]:
+        fourier_fig.add_trace(
+            go.Scatter(
+                x=fourier_history["Time (s)"],
+                y=fourier_history[col],
+                mode="lines",
+                name=col.replace(" Temp (C)", ""),
+            )
+        )
+    fourier_fig.update_layout(
+        height=460,
+        title="1-D Fourier Conduction Temperature History",
+        xaxis_title="Time (s)",
+        yaxis_title="Temperature (°C)",
+    )
+    st.plotly_chart(fourier_fig, width="stretch", config={"responsive": True, "displaylogo": False})
+
+    final_profile = fourier_profile[
+        fourier_profile["Time (s)"] == fourier_profile["Time (s)"].max()
+    ]
+    profile_fig = go.Figure()
+    profile_fig.add_trace(
+        go.Scatter(
+            x=final_profile["Depth (mm)"],
+            y=final_profile["Temperature (C)"],
+            mode="lines+markers",
+            name="Final Temperature Profile",
+        )
+    )
+    profile_fig.update_layout(
+        height=400,
+        title="Final Through-Thickness Temperature Profile",
+        xaxis_title="Depth (mm)",
+        yaxis_title="Temperature (°C)",
+    )
+    st.plotly_chart(profile_fig, width="stretch", config={"responsive": True, "displaylogo": False})
+
+    st.divider()
+    st.markdown("#### Frequency-Domain Thermal Load Diagnostic")
+    fd1, fd2, fd3 = st.columns(3)
+    with fd1:
+        fd_period_s = st.slider("Pulse / cycle period (s)", 0.2, 60.0, 5.0, 0.2, key="fd_period_s")
+    with fd2:
+        fd_duty = st.slider("Duty cycle", 0.05, 1.0, 0.40, 0.05, key="fd_duty")
+    with fd3:
+        fd_heat_kw = st.number_input(
+            "Active internal heat load (kW)",
+            min_value=0.0,
+            max_value=100000.0,
+            value=float(max(result.get("Internal Heat (kW)", 0.0), 0.0)),
+            step=1.0,
+            key="fd_heat_kw",
+        )
+
+    freq_df = periodic_thermal_frequency_diagnostic(
+        duration_s=max(tp_duration_s, 60.0),
+        sample_dt_s=min(tp_dt_s, 0.1),
+        active_heat_kw=fd_heat_kw,
+        duty_cycle=fd_duty,
+        period_s=fd_period_s,
+    )
+    freq_plot = go.Figure()
+    if not freq_df.empty:
+        top_freq = freq_df.sort_values("Amplitude (kW)", ascending=False).head(40)
+        freq_plot.add_trace(go.Bar(x=top_freq["Frequency (Hz)"], y=top_freq["Amplitude (kW)"]))
+    freq_plot.update_layout(
+        height=400,
+        title="Periodic Thermal-Load Frequency Spectrum",
+        xaxis_title="Frequency (Hz)",
+        yaxis_title="Amplitude (kW)",
+    )
+    st.plotly_chart(freq_plot, width="stretch", config={"responsive": True, "displaylogo": False})
+
+    st.divider()
+    st.markdown("#### Thermal Decision Support")
+    st.caption(
+        "Deterministic, physics-informed decision support. No trained AI/ML model is "
+        "claimed by this layer."
+    )
+    decision_df = pd.DataFrame(
+        [
+            {
+                "Decision Variable": "Component thermal readiness",
+                "Value": thermal_summary["readiness"],
+                "Basis": thermal_summary["recommendation"],
+            },
+            {
+                "Decision Variable": "Primary-model thermal margin",
+                "Value": f"{result.get('Thermal Margin', float('nan')):.3f}",
+                "Basis": "Existing platform power/thermal model",
+            },
+            {
+                "Decision Variable": "Energy margin",
+                "Value": f"{result.get('Energy Margin', float('nan')):.3f}",
+                "Basis": "Existing platform stored-energy model",
+            },
+            {
+                "Decision Variable": "Power availability ratio",
+                "Value": f"{result.get('Power Availability Ratio', float('nan')):.3f}",
+                "Basis": "Generator + storage power constraints",
+            },
+            {
+                "Decision Variable": "Fourier front-surface peak",
+                "Value": f"{fourier_summary['front_peak_c']:.1f} °C",
+                "Basis": "Optional 1-D transient conduction study",
+            },
+        ]
+    )
+    st.dataframe(decision_df, width="stretch", hide_index=True)
+
+    thermal_export = {
+        "generated_utc": datetime.utcnow().isoformat() + "Z",
+        "component_assumptions": component_table.to_dict(orient="records"),
+        "component_summary": thermal_summary,
+        "component_requirements": thermal_req_df.to_dict(orient="records"),
+        "fourier_summary": fourier_summary,
+        "decision_support": decision_df.to_dict(orient="records"),
+        "limitations": [
+            "Primary directed-energy engagement calculations remain unchanged.",
+            "Component thermal conductances and capacities are generic engineering assumptions.",
+            "1-D Fourier material properties are user-specified and not validated hardware data.",
+            "Frequency-domain analysis is a signal diagnostic, not a heat-conduction solver.",
+            "No trained AI/ML model is used by this thermal decision-support layer.",
+        ],
+    }
+
+    tx1, tx2, tx3 = st.columns(3)
+    with tx1:
+        st.download_button(
+            "Download Component Thermal History CSV",
+            thermal_history.to_csv(index=False).encode("utf-8"),
+            file_name="thermal_component_history.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with tx2:
+        st.download_button(
+            "Download Fourier 1-D History CSV",
+            fourier_history.to_csv(index=False).encode("utf-8"),
+            file_name="fourier_1d_thermal_history.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+    with tx3:
+        st.download_button(
+            "Download Thermal Digital Twin JSON",
+            json.dumps(thermal_export, indent=2, default=str).encode("utf-8"),
+            file_name="thermal_power_digital_twin.json",
+            mime="application/json",
+            width="stretch",
+        )
+
 
 st.divider()
 
@@ -11957,14 +13034,15 @@ st.caption(
     "visibility-derived aerosol extinction, Rayleigh scaling, and a generic humidity "
     "term. Tracking uses sequential constant-velocity Kalman covariance propagation, "
     "and azimuth/elevation LOS rates are computed directly from the evolving 3-D geometry. "
-    "Target response uses a lumped areal thermal model. The 3-D view renders the same "
+    "Target response uses a lumped areal thermal model. An optional Thermal & Power Digital Twin "
+    "adds a generic multi-node component thermal network, a user-parameterized 1-D Fourier "
+    "conduction study, and deterministic thermal decision support without replacing the primary "
+    "engagement model. The 3-D view renders the same "
     "modeled x/y/z constant-velocity target state used by the engagement physics, including "
     "slant range, CPA, LOS geometry, covariance projection, and beam pointing. The model "
     "does not include full aerodynamic flight dynamics or target-specific guidance laws. "
     "None of these models constitute validated "
     "operational weapon-performance, lethality, or probability-of-kill predictions. "
     "The current target preset library spans multiple generic airborne target classes, "
-    "and target-speed applicability is governed by the active model configuration and demonstrated validation regime. "
-"The Advanced Twin supports higher-fidelity generic aerospace kinematics, including 6-DOF rigid-body propagation; "
-"results outside matched or observationally validated cases remain engineering simulation outputs."
+    "and the directed-energy effect-model target-speed envelope remains intentionally limited to 350 m/s; higher-speed generic aerospace kinematics are isolated in the Advanced Twin."
 )
