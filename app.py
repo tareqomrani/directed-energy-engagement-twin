@@ -5,6 +5,7 @@ import io
 import zipfile
 import urllib.request
 import urllib.error
+import tempfile
 from datetime import datetime
 from dataclasses import dataclass, asdict
 
@@ -2024,6 +2025,24 @@ def simulate_component_thermal_network(
             G[i, j] = G[j, i] = max(float(g), 0.0)
 
     row_conductance = G.sum(axis=1)
+
+    # Include the local slope of the heat-exchanger sink in the explicit
+    # stability estimate. In the unsaturated linear region:
+    #   Q_sink = G_sink * (T_hx - T_ambient)
+    # where G_sink = Q_cooling,max / reference thermal head.
+    if "Heat Exchanger" in index:
+        hx = index["Heat Exchanger"]
+        reference_head_c = max(
+            float(platform.thermal_limit_c) - float(env.ambient_temp_c),
+            1.0,
+        )
+        hx_sink_conductance = (
+            max(float(platform.cooling_capacity_kw), 0.0)
+            * cooling_command
+            / reference_head_c
+        )
+        row_conductance[hx] += hx_sink_conductance
+
     positive = row_conductance > 1e-12
     if np.any(positive):
         tau_min = float(np.min(C[positive] / row_conductance[positive]))
@@ -2055,7 +2074,25 @@ def simulate_component_thermal_network(
     next_out = 1
 
     while t < duration_s - 1e-12:
-        h = min(stable_dt, duration_s - t)
+        next_output_time = (
+            float(output_times[next_out])
+            if next_out < len(output_times)
+            else float(duration_s)
+        )
+        h = min(
+            stable_dt,
+            duration_s - t,
+            max(next_output_time - t, 0.0)
+            if next_output_time > t + 1e-12
+            else stable_dt,
+        )
+        if h <= 1e-12:
+            if next_out < len(output_times):
+                record_state(output_times[next_out], T, 0.0)
+                next_out += 1
+                continue
+            break
+
         q_net = q_external.copy()
 
         for i in range(n):
@@ -2086,7 +2123,7 @@ def simulate_component_thermal_network(
         T = np.maximum(T, float(env.ambient_temp_c) - 20.0)
         t += h
 
-        while next_out < len(output_times) and t >= output_times[next_out] - 1e-10:
+        if next_out < len(output_times) and abs(t - output_times[next_out]) <= 1e-9:
             record_state(output_times[next_out], T, sink_kw)
             next_out += 1
 
@@ -2127,27 +2164,43 @@ def simulate_component_thermal_network(
     # Normalize each component against its own initial state and own limit.
     initial_temps = table["Initial Temp (C)"].astype(float).to_numpy()
     normalized_margins = {}
+    invalid_initial_components = []
     for name in names:
         i = index[name]
-        denominator = max(
-            float(limits[i] - initial_temps[i]),
-            1e-6,
-        )
+        initial_margin = float(limits[i] - initial_temps[i])
+        if initial_margin <= 0.0:
+            normalized_margins[name] = float("nan")
+            invalid_initial_components.append(name)
+            continue
+
         normalized_margins[name] = min(
             1.0,
             float(
                 (limits[i] - peak_temps[name])
-                / denominator
+                / initial_margin
             ),
         )
 
+    finite_normalized_margins = [
+        value
+        for value in normalized_margins.values()
+        if math.isfinite(value)
+    ]
     normalized_headroom = (
-        min(normalized_margins.values())
-        if normalized_margins
+        min(finite_normalized_margins)
+        if finite_normalized_margins
         else float("nan")
     )
 
-    if time_to_limit_observed:
+    if invalid_initial_components:
+        readiness = "INVALID"
+        recommendation = (
+            "INVALID INITIAL CONDITION: component temperature is at or above "
+            "its modeled limit for "
+            + ", ".join(invalid_initial_components)
+            + "."
+        )
+    elif time_to_limit_observed:
         readiness = "HOLD"
         recommendation = (
             f"HOLD / COOL: {first_limit_component} reaches its modeled limit "
@@ -2177,6 +2230,7 @@ def simulate_component_thermal_network(
         "simulation_horizon_s": float(duration_s),
         "normalized_thermal_headroom": float(normalized_headroom),
         "component_normalized_margins": normalized_margins,
+        "invalid_initial_components": invalid_initial_components,
         "peak_temperatures_c": peak_temps,
         "component_limits_c": {
             name: float(limits[index[name]]) for name in names
@@ -2285,7 +2339,25 @@ def simulate_fourier_1d_slab(
     next_out = 1
 
     while t < duration_s - 1e-12:
-        h = min(dt_internal, duration_s - t)
+        next_output_time = (
+            float(output_times[next_out])
+            if next_out < len(output_times)
+            else float(duration_s)
+        )
+        h = min(
+            dt_internal,
+            duration_s - t,
+            max(next_output_time - t, 0.0)
+            if next_output_time > t + 1e-12
+            else dt_internal,
+        )
+        if h <= 1e-12:
+            if next_out < len(output_times):
+                store(output_times[next_out])
+                next_out += 1
+                continue
+            break
+
         q = np.zeros(node_count, dtype=float)
 
         for i in range(node_count - 1):
@@ -2299,7 +2371,7 @@ def simulate_fourier_1d_slab(
         T = T + h * q / cell_capacity_j_m2k
         t += h
 
-        while next_out < len(output_times) and t >= output_times[next_out] - 1e-10:
+        if next_out < len(output_times) and abs(t - output_times[next_out]) <= 1e-9:
             store(output_times[next_out])
             next_out += 1
 
@@ -2401,7 +2473,7 @@ def thermal_power_requirement_table(
             "Allocated Function": "Reject and distribute waste heat",
             "Allocated Model / Subsystem": "Component thermal-state network",
             "Verification Method": "Analysis",
-            "Verification Case": "Current thermal-network scenario",
+            "Verification Case": "VC-THM-001",
             "Evidence": "Minimum component peak-temperature margin",
             "Metric": "Minimum component peak-temperature margin (°C)",
             "Value": float(
@@ -2422,7 +2494,7 @@ def thermal_power_requirement_table(
             "Allocated Function": "Maintain thermal headroom",
             "Allocated Model / Subsystem": "Component thermal-state network",
             "Verification Method": "Analysis",
-            "Verification Case": "Current thermal-network scenario",
+            "Verification Case": "VC-THM-001",
             "Evidence": "Minimum normalized component-specific thermal margin",
             "Metric": "Normalized component thermal headroom",
             "Value": float(
@@ -2481,7 +2553,7 @@ def thermal_power_requirement_table(
             "Allocated Function": "Predict thermal operating window",
             "Allocated Model / Subsystem": "Component thermal-state network",
             "Verification Method": "Analysis",
-            "Verification Case": "Current thermal-network scenario",
+            "Verification Case": "VC-THM-001",
             "Evidence": ttl_evidence,
             "Metric": "Time to first component thermal limit (s)",
             "Value": float(ttl_value),
@@ -2491,7 +2563,7 @@ def thermal_power_requirement_table(
         }
     )
 
-    return pd.DataFrame(rows)
+    return validate_traceability_links(pd.DataFrame(rows))
 
 # ============================================================
 # Coupled engagement model
@@ -6813,6 +6885,75 @@ def generic_ekf_track(
     return pd.DataFrame(rows)
 
 
+REQUIREMENTS_BASELINE = {
+    "Baseline ID": "BL-001",
+    "Version": "1.0",
+    "Status": "Draft engineering baseline",
+    "Owner": "Digital Twin Engineering",
+}
+
+NEEDS_REGISTRY = {
+    "NEED-TRK-001": {
+        "Statement": "Maintain sufficient target-state knowledge for stable engagement decisions.",
+        "Stakeholder / Source": "Mission / tracking architecture",
+    },
+    "NEED-PNT-001": {
+        "Statement": "Maintain sufficient beam-placement accuracy for the modeled engagement.",
+        "Stakeholder / Source": "Mission / beam-control architecture",
+    },
+    "NEED-THM-001": {
+        "Statement": "Maintain modeled thermal limits and usable thermal margin.",
+        "Stakeholder / Source": "Platform thermal management",
+    },
+    "NEED-PWR-001": {
+        "Statement": "Maintain electrical-energy availability through the modeled engagement.",
+        "Stakeholder / Source": "Platform power management",
+    },
+    "NEED-SNS-001": {
+        "Statement": "Provide sufficient target detection performance for engagement-loop initiation.",
+        "Stakeholder / Source": "Mission / sensing architecture",
+    },
+}
+
+SYSTEM_REQUIREMENTS_REGISTRY = {
+    "SYS-TRK-001": {"Parent Need": "NEED-TRK-001", "Allocated Function": "Estimate target state"},
+    "SYS-PNT-001": {"Parent Need": "NEED-PNT-001", "Allocated Function": "Point and stabilize beam director"},
+    "SYS-THM-001": {"Parent Need": "NEED-THM-001", "Allocated Function": "Reject and manage waste heat"},
+    "SYS-PWR-001": {"Parent Need": "NEED-PWR-001", "Allocated Function": "Supply and manage electrical energy"},
+    "SYS-SNS-001": {"Parent Need": "NEED-SNS-001", "Allocated Function": "Detect target"},
+    "SYS-CTL-001": {"Parent Need": "NEED-THM-001", "Allocated Function": "Predict thermal operating window"},
+}
+
+VERIFICATION_CASE_REGISTRY = {
+    "VC-ENG-001": {
+        "Method": "Analysis",
+        "Description": "Current deterministic engagement simulation",
+    },
+    "VC-THM-001": {
+        "Method": "Analysis",
+        "Description": "Current component thermal-network simulation",
+    },
+}
+
+
+def validate_traceability_links(df: pd.DataFrame) -> pd.DataFrame:
+    """Check that textual traceability IDs resolve to defined model artifacts."""
+    checked = df.copy()
+    need_ok = checked["Need ID"].map(lambda x: x in NEEDS_REGISTRY)
+    parent_ok = checked["Parent Requirement"].map(
+        lambda x: x in SYSTEM_REQUIREMENTS_REGISTRY
+    )
+    checked["Trace Link Status"] = np.where(
+        need_ok & parent_ok,
+        "LINKED",
+        "BROKEN LINK",
+    )
+    checked["Baseline ID"] = REQUIREMENTS_BASELINE["Baseline ID"]
+    checked["Baseline Version"] = REQUIREMENTS_BASELINE["Version"]
+    checked["Baseline Status"] = REQUIREMENTS_BASELINE["Status"]
+    return checked
+
+
 def requirement_evaluation_table(
     result: dict,
     min_track_quality: float,
@@ -6842,7 +6983,7 @@ def requirement_evaluation_table(
             "Allocated Function": "Estimate target state",
             "Allocated Model / Subsystem": "State estimation / EKF",
             "Verification Method": "Analysis",
-            "Verification Case": "Current engagement simulation",
+            "Verification Case": "VC-ENG-001",
             "Evidence": "Track Quality",
             "Metric": "Track quality",
             "Value": result.get("Track Quality", float("nan")),
@@ -6861,7 +7002,7 @@ def requirement_evaluation_table(
             "Allocated Function": "Point and stabilize beam director",
             "Allocated Model / Subsystem": "Pointing / beam geometry",
             "Verification Method": "Analysis",
-            "Verification Case": "Current engagement simulation",
+            "Verification Case": "VC-ENG-001",
             "Evidence": "Effective Pointing Error (mrad)",
             "Metric": "Effective pointing error (mrad)",
             "Value": result.get("Effective Pointing Error (mrad)", float("nan")),
@@ -6880,7 +7021,7 @@ def requirement_evaluation_table(
             "Allocated Function": "Reject waste heat",
             "Allocated Model / Subsystem": "Platform power/thermal",
             "Verification Method": "Analysis",
-            "Verification Case": "Current engagement simulation",
+            "Verification Case": "VC-ENG-001",
             "Evidence": "Thermal Margin",
             "Metric": "Thermal margin",
             "Value": result.get("Thermal Margin", float("nan")),
@@ -6899,7 +7040,7 @@ def requirement_evaluation_table(
             "Allocated Function": "Supply and manage electrical energy",
             "Allocated Model / Subsystem": "Platform power/energy",
             "Verification Method": "Analysis",
-            "Verification Case": "Current engagement simulation",
+            "Verification Case": "VC-ENG-001",
             "Evidence": "Energy Margin",
             "Metric": "Energy margin",
             "Value": result.get("Energy Margin", float("nan")),
@@ -6918,7 +7059,7 @@ def requirement_evaluation_table(
             "Allocated Function": "Detect target",
             "Allocated Model / Subsystem": "Sensor/detection model",
             "Verification Method": "Analysis",
-            "Verification Case": "Current engagement simulation",
+            "Verification Case": "VC-ENG-001",
             "Evidence": "Detection Probability",
             "Metric": "Detection probability",
             "Value": result.get("Detection Probability", float("nan")),
@@ -6942,7 +7083,7 @@ def requirement_evaluation_table(
         row_out["Status"] = status
         rows.append(row_out)
 
-    return pd.DataFrame(rows)
+    return validate_traceability_links(pd.DataFrame(rows))
 
 
 def generic_trade_study(
@@ -7201,6 +7342,9 @@ NOAA_IGRA_URL = (
     "integrated-global-radiosonde-archive"
 )
 NOAA_IGRA_DATA_BASE = "https://www.ncei.noaa.gov/pub/data/igra/data/data-por"
+NOAA_IGRA_Y2D_BASE = "https://www.ncei.noaa.gov/pub/data/igra/data/data-y2d"
+NOAA_IGRA_MAX_COMPRESSED_BYTES = 160 * 1024 * 1024
+NOAA_IGRA_NETWORK_TIMEOUT_S = 15
 
 
 def regression_error_metrics(
@@ -7718,13 +7862,12 @@ def canonicalize_nasa_gtm_csv(
 
     if body_frame_convention == "NASA/GTM FRD":
         # FRD/NED -> app FLU/z-up basis transform, S = diag(1, -1, -1).
+        # Vector/pseudovector components transform directly.
         for col in [
             "V body (m/s)",
             "W body (m/s)",
             "q body rate (deg/s)",
             "r body rate (deg/s)",
-            "Pitch (deg)",
-            "Yaw (deg)",
             "Fy body (N)",
             "Fz body (N)",
             "M body moment (N·m)",
@@ -7732,6 +7875,42 @@ def canonicalize_nasa_gtm_csv(
         ]:
             if col in out.columns:
                 out[col] *= -1.0
+
+        # Attitude conversion is performed through the authoritative DCM,
+        # rather than treating Euler-angle sign changes as the transformation.
+        attitude_cols = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
+        if all(col in out.columns for col in attitude_cols):
+            S = np.diag([1.0, -1.0, -1.0])
+            converted = []
+            for roll, pitch, yaw in out[attitude_cols].itertuples(
+                index=False, name=None
+            ):
+                if not all(math.isfinite(float(v)) for v in (roll, pitch, yaw)):
+                    converted.append((float("nan"), float("nan"), float("nan")))
+                    continue
+                q_old = quaternion_from_euler_deg(roll, pitch, yaw)
+                C_old = quaternion_to_dcm_body_to_inertial(q_old)
+                C_new = S @ C_old @ S.T
+
+                pitch_new = math.asin(
+                    clamp(-float(C_new[2, 0]), -1.0, 1.0)
+                )
+                roll_new = math.atan2(
+                    float(C_new[2, 1]),
+                    float(C_new[2, 2]),
+                )
+                yaw_new = math.atan2(
+                    float(C_new[1, 0]),
+                    float(C_new[0, 0]),
+                )
+                converted.append(
+                    tuple(
+                        math.degrees(v)
+                        for v in (roll_new, pitch_new, yaw_new)
+                    )
+                )
+
+            out.loc[:, attitude_cols] = np.asarray(converted, dtype=float)
     elif body_frame_convention != "App FLU":
         raise ValueError(
             "body_frame_convention must be 'NASA/GTM FRD' or 'App FLU'."
@@ -8035,10 +8214,16 @@ def simulate_matched_six_dof_gtm_case(
                 command_force_b = constant_force_n
                 command_moment_b = constant_moment_nm
 
-            force_b = (
-                command_force_b
-                + drag_force_b
-            )
+            if excitation_mode == "Reference force/moment histories":
+                # Reference histories are interpreted as resultant
+                # non-gravitational body forces/moments. Do not add the generic
+                # drag or damping models a second time.
+                force_b = command_force_b
+            else:
+                force_b = (
+                    command_force_b
+                    + drag_force_b
+                )
 
             gravity_b = (
                 C_ib
@@ -8055,16 +8240,19 @@ def simulate_matched_six_dof_gtm_case(
                 )
             )
 
-            moment_b = (
-                command_moment_b
-                - max(
-                    float(
-                        rotational_damping_nm_per_rad_s
-                    ),
-                    0.0,
+            if excitation_mode == "Reference force/moment histories":
+                moment_b = command_moment_b
+            else:
+                moment_b = (
+                    command_moment_b
+                    - max(
+                        float(
+                            rotational_damping_nm_per_rad_s
+                        ),
+                        0.0,
+                    )
+                    * omega_b
                 )
-                * omega_b
-            )
 
             omega_dot_b = (
                 inertia_inv
@@ -8396,6 +8584,214 @@ def parse_igra_station_text(
 
     return pd.DataFrame(
         rows
+    )
+
+
+def _igra_header_datetime(line: str):
+    """Return the UTC datetime encoded in an IGRA sounding header, or None."""
+    if not line.startswith("#"):
+        return None
+    try:
+        year = int(line[13:17])
+        month = int(line[18:20])
+        day = int(line[21:23])
+        hour = int(line[24:26])
+        return datetime(year, month, day, max(hour, 0))
+    except Exception:
+        return None
+
+
+def _download_igra_zip_to_temp(url: str):
+    """
+    Download an IGRA ZIP to a temporary disk-backed file.
+
+    The response is streamed in bounded chunks rather than copied into a giant
+    in-memory bytes object. A compressed-size guard prevents an unexpectedly
+    large external payload from exhausting a constrained Streamlit process.
+    """
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "DirectedEnergyDigitalTwin/ValidationBenchmarking",
+            "Accept": "application/zip, application/octet-stream;q=0.9, */*;q=0.1",
+        },
+    )
+
+    tmp = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    total = 0
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=NOAA_IGRA_NETWORK_TIMEOUT_S,
+        ) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared = int(content_length)
+                except Exception:
+                    declared = None
+                if (
+                    declared is not None
+                    and declared > NOAA_IGRA_MAX_COMPRESSED_BYTES
+                ):
+                    raise ValueError(
+                        "NOAA IGRA archive is too large for the configured "
+                        "validation download limit."
+                    )
+
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > NOAA_IGRA_MAX_COMPRESSED_BYTES:
+                    raise ValueError(
+                        "NOAA IGRA archive exceeded the configured "
+                        "validation download limit."
+                    )
+                tmp.write(chunk)
+
+        tmp.seek(0)
+        return tmp, total
+
+    except urllib.error.HTTPError as exc:
+        tmp.close()
+        raise ValueError(
+            f"NOAA IGRA download failed (HTTP {exc.code})."
+        ) from exc
+    except urllib.error.URLError as exc:
+        tmp.close()
+        raise ValueError(
+            "NOAA IGRA network request failed or timed out."
+        ) from exc
+    except Exception:
+        tmp.close()
+        raise
+
+
+@st.cache_data(
+    ttl=3600,
+    show_spinner=False,
+)
+def fetch_noaa_igra_sounding(
+    station_id: str,
+    requested_time: datetime,
+):
+    """
+    Retrieve only the sounding nearest the requested UTC time.
+
+    For the current year, prefer NOAA's much smaller year-to-date archive.
+    Historical requests use the period-of-record archive, but the ZIP remains
+    disk-backed and is scanned one sounding block at a time. Only the best
+    candidate block is retained in memory.
+    """
+    station = station_id.strip().upper()
+    if len(station) != 11:
+        raise ValueError("IGRA station IDs contain 11 characters.")
+
+    requested = pd.Timestamp(requested_time).to_pydatetime()
+    current_year = datetime.utcnow().year
+
+    candidates = []
+    if requested.year == current_year:
+        candidates.append(
+            (
+                "year-to-date",
+                f"{NOAA_IGRA_Y2D_BASE}/{station}-data-beg{current_year}.txt.zip",
+            )
+        )
+    candidates.append(
+        (
+            "period-of-record",
+            f"{NOAA_IGRA_DATA_BASE}/{station}-data.txt.zip",
+        )
+    )
+
+    last_error = None
+    for source_label, url in candidates:
+        tmp = None
+        try:
+            tmp, compressed_bytes = _download_igra_zip_to_temp(url)
+
+            if not zipfile.is_zipfile(tmp):
+                raise ValueError("NOAA response was not a valid ZIP archive.")
+
+            tmp.seek(0)
+            with zipfile.ZipFile(tmp) as archive:
+                members = [
+                    info for info in archive.infolist()
+                    if not info.is_dir()
+                ]
+                if not members:
+                    raise ValueError("NOAA IGRA ZIP contained no data file.")
+
+                member = members[0]
+                best_time = None
+                best_lines = None
+                current_time = None
+                current_lines = []
+
+                def consider_block(block_time, block_lines):
+                    nonlocal best_time, best_lines
+                    if block_time is None or not block_lines:
+                        return
+                    if (
+                        best_time is None
+                        or abs(block_time - requested)
+                        < abs(best_time - requested)
+                    ):
+                        best_time = block_time
+                        best_lines = list(block_lines)
+
+                with archive.open(member, "r") as raw:
+                    wrapper = io.TextIOWrapper(
+                        raw,
+                        encoding="utf-8",
+                        errors="replace",
+                        newline="",
+                    )
+                    for line in wrapper:
+                        if line.startswith("#"):
+                            consider_block(current_time, current_lines)
+                            current_time = _igra_header_datetime(line)
+                            current_lines = [line]
+                        elif current_time is not None:
+                            current_lines.append(line)
+
+                    consider_block(current_time, current_lines)
+
+                if best_time is None or not best_lines:
+                    raise ValueError(
+                        "No valid sounding headers were found in the NOAA archive."
+                    )
+
+                sounding_df = parse_igra_station_text("".join(best_lines))
+                if sounding_df.empty:
+                    raise ValueError(
+                        "The nearest NOAA sounding contained no parseable levels."
+                    )
+
+                metadata = {
+                    "source": source_label,
+                    "compressed_bytes": int(compressed_bytes),
+                    "url": url,
+                }
+                return sounding_df.reset_index(drop=True), best_time, metadata
+
+        except Exception as exc:
+            last_error = exc
+            # If the compact YTD archive is unavailable, try POR. If POR fails,
+            # propagate a controlled error to the UI.
+            continue
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.close()
+                except Exception:
+                    pass
+
+    raise ValueError(
+        f"Unable to retrieve a usable NOAA IGRA sounding: {last_error}"
     )
 
 
@@ -12379,19 +12775,21 @@ with tab10:
         width="stretch",
     ):
         try:
-            station_df = fetch_noaa_igra_station(
-                igra_station_id
-            )
             requested_dt = datetime(
                 igra_date.year,
                 igra_date.month,
                 igra_date.day,
                 int(igra_hour),
             )
-            sounding_df, selected_time = select_nearest_igra_sounding(
-                station_df,
-                requested_dt,
-            )
+            with st.spinner(
+                "Retrieving the nearest NOAA IGRA sounding..."
+            ):
+                sounding_df, selected_time, retrieval_meta = (
+                    fetch_noaa_igra_sounding(
+                        igra_station_id,
+                        requested_dt,
+                    )
+                )
 
             st.session_state[
                 "igra_selected_sounding"
@@ -12402,10 +12800,16 @@ with tab10:
             st.session_state[
                 "igra_selected_station"
             ] = igra_station_id.strip().upper()
+            st.session_state[
+                "igra_retrieval_meta"
+            ] = retrieval_meta
 
         except Exception as exc:
+            # Preserve the last valid sounding in session state. External-data
+            # failure must not invalidate the rest of the digital twin.
             st.error(
-                f"NOAA IGRA retrieval failed: {exc}"
+                "NOAA IGRA retrieval failed without changing the last valid "
+                f"sounding: {exc}"
             )
 
     selected_sounding = st.session_state.get(
@@ -12761,7 +13165,7 @@ with tab11:
     )
     st.plotly_chart(component_temp_fig, width="stretch", config={"responsive": True, "displaylogo": False})
 
-    st.markdown("##### Thermal Readiness Requirements")
+    st.markdown("##### Thermal Readiness Requirements / Trade Thresholds")
     tr1, tr2, tr3 = st.columns(3)
     with tr1:
         tp_req_margin_c = st.slider("REQ-THM-002 min component margin (°C)", 0.0, 30.0, 5.0, 0.5, key="tp_req_margin_c")
