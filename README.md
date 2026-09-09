@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Banner-7.png"
+  <img src="Banner-7.PNG"
        alt="Directed Energy Engagement Digital Twin"
        width="100%">
 </p>
