@@ -9779,6 +9779,11 @@ with st.sidebar:
         "affects slant range, LOS geometry, tracking, beam pointing, and propagation."
     )
 
+    st.divider()
+    if st.button("▶ Run Engagement", type="primary", use_container_width=True, key="run_engagement_sidebar"):
+        st.session_state["engagement_run_requested"] = True
+
+
 
 env = Environment(
     range_km,
@@ -9852,6 +9857,9 @@ timeline, result = simulate_time_stepped_engagement(
     platform,
     dt_s=0.10,
 )
+
+if st.session_state.pop("engagement_run_requested", False):
+    st.toast("Engagement simulation updated with the current scenario settings.")
 
 los_rate_for_dt = float(result.get("LOS Rate (mrad/s)", 0.0)) / 1000.0
 recommended_dt = recommended_solver_dt_s(
