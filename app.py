@@ -9272,6 +9272,34 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Navigation cue stays in the main pane, even when the sidebar is collapsed.
+st.markdown(
+    f"""
+    <div role="note" style="
+        display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+        border-left:4px solid {HUD_ORANGE_BRIGHT};
+        border-top:1px solid rgba(124,255,34,.25);
+        border-right:1px solid rgba(124,255,34,.25);
+        border-bottom:1px solid rgba(124,255,34,.25);
+        background:linear-gradient(90deg,rgba(255,122,24,.09),rgba(6,17,6,.94));
+        border-radius:8px;padding:10px 14px;margin:0 0 12px 0;
+    ">
+        <span aria-hidden="true" style="color:{HUD_ORANGE_BRIGHT};font-size:1.45rem;">◀</span>
+        <div style="flex:1;min-width:190px;">
+            <div style="color:{HUD_GREEN_BRIGHT};font-weight:800;letter-spacing:.06em;">
+                ⚙️ CONFIGURE SCENARIO IN THE LEFT SIDEBAR
+            </div>
+            <div style="color:{HUD_TEXT};font-size:.86rem;line-height:1.45;margin-top:2px;">
+                Set environment, target, sensors, HEL, and platform parameters.
+                Then select <strong>▶ Run Engagement</strong> at the bottom of the sidebar.
+                On mobile, use the sidebar toggle in the upper-left to open the controls.
+            </div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.caption(
     "Low-order, non-classified digital engineering prototype. "
     "The model now includes Kalman covariance propagation, Beer-Lambert atmospheric "
